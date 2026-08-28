@@ -8,11 +8,8 @@ example repo — kept only as pinout/API reference, not built directly.
 
 Also separate: `../heltec-rx-test/`, a throwaway RX bench rig on a Heltec
 WiFi LoRa 32 V3 used to confirm this board's LoRa TX is actually reaching a
-second radio — decrypted payload + RSSI/SNR go to both serial and the
-Heltec's onboard SSD1306 OLED, which wakes for 5s on each received signal
-and sleeps otherwise. It also replies with an `ACK,<id>` for every valid
-packet it decrypts, which is what makes the T-Beam's "Delivered" status
-real (see FW-06 below). Not part of the product firmware.
+second radio (prints received payload + RSSI/SNR to serial). Not part of the
+product firmware.
 
 ## Test hardware on hand
 
@@ -20,26 +17,15 @@ real (see FW-06 below). Not part of the product firmware.
 single sender/receiver pair once we get there — e.g. two T-Beam senders into
 one gateway, or a relay hop — not just the current one-to-one link test.
 
-## Status: Milestone 1 — GPS + LoRa send loop, with SOS button and status display
+## Status: Milestone 1 — GPS + LoRa send loop, with SOS button
 
 Reads GPS fixes and transmits location over LoRa on a timer. The onboard
 BOOT button (GPIO0) toggles a standing SOS beacon: pressing it sends an
 immediate "SOS"-flagged packet and switches every subsequent periodic send
 to "SOS" too (instead of the routine "OK") until pressed again to cancel —
-see `sendLocationPacket()` / `pollButton()` in `src/main.cpp`.
-
-An SH1106 OLED (I2C, pins 17/18) shows live status via `showStatus()`:
-message type on top, "Sending" / "Delivered" / "No ACK" / "Send failed"
-below. "Delivered" is now a real ACK, not an assumption: each packet carries
-a small message id (`<type>,<id>,<location>`), and after transmitting, the
-T-Beam listens for up to `ACK_TIMEOUT_MS` (2s) for a matching `ACK,<id>`
-reply from the Heltec RX rig (`waitForAck()`/`sendAck()`). A timeout with no
-reply shows "No ACK" — distinct from "Send failed," which means the radio
-call itself errored, not that nobody answered.
-
-The panel stays off between transmissions to save power — it wakes for a
-send and holds for `DISPLAY_HOLD_MS` (5s) after the result, then sleeps
-again (`displayWake()`/`displaySleep()`, timer checked in `loop()`).
+see `sendLocationPacket()` / `pollButton()` in `src/main.cpp`. No display
+yet, and no ACK, so "sent ok" on serial is not the same as "a human saw
+this."
 
 ## Build / flash
 
@@ -85,15 +71,8 @@ behind the ALDO3/ALDO4 rails, which are off at boot. `initPower()` in
 `main.cpp` turns them on — skip that step and the radio/GPS silently never
 power up even with correct wiring.
 
-RadioLib's `setDio1Action()` (used for interrupt-driven receive, see
-`heltec-rx-test/`) fires on any rising edge on that pin — it doesn't know
-whether the chip currently means RX-done or TX-done by it. Any
-`radio.transmit()` call made while that interrupt is attached (e.g. sending
-an ACK from within the RX loop) will trip the same callback via its own
-TX-done pulse, so the flag it sets must be explicitly cleared after your own
-transmits or the next loop iteration will treat it as a real received
-packet — see the comment on `sendAck()` in `heltec-rx-test/src/main.cpp`.
-
 ## Next milestones (not yet implemented)
 
+- LCD status display ("Sending" / "Delivered")
+- LoRa RX side / ACK handling so "Delivered" status is real, not assumed
 - Power measurement against the report's theoretical current-draw numbers

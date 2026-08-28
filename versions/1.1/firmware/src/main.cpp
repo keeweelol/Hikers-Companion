@@ -33,12 +33,6 @@ static constexpr int8_t LORA_TX_POWER_DBM = 17;
 // constant here so it's easy to tune once battery-life testing informs it.
 static constexpr uint32_t SEND_INTERVAL_MS = 60000;
 
-// How long to listen for an ACK after transmitting before giving up. This
-// blocks loop() (GPS/button polling included) for up to this long right
-// after a send -- acceptable since it only happens once per send, not
-// continuously.
-static constexpr uint32_t ACK_TIMEOUT_MS = 2000;
-
 // GPIO0 has no external debounce hardware on this board -- a plain
 // digitalRead() chatters across several transitions on every press/release.
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
@@ -62,7 +56,6 @@ static constexpr uint8_t DISPLAY_I2C_ADDR = 0x3C;
 Adafruit_SH1106G display(DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, -1);
 
 uint32_t lastSendMs = 0;
-uint16_t nextMessageId = 0;
 
 // BUTTON_PIN uses INPUT_PULLUP, so idle-high/pressed-low.
 bool lastButtonReading = HIGH;
@@ -203,52 +196,13 @@ static String buildLocationMessage() {
     return message;
 }
 
-// Listens for up to ACK_TIMEOUT_MS for a reply matching "ACK,<expectedId>".
-// radio.receive() blocks (with the given timeout) and internally calls
-// readData() for us, so no separate startReceive()/interrupt dance is
-// needed here -- that pattern is only for continuous listening.
-static bool waitForAck(uint16_t expectedId) {
-    static constexpr size_t kMaxAckCipherLen = 64;
-    uint8_t ackCipherBuf[kMaxAckCipherLen];
-
-    int state = radio.receive(ackCipherBuf, kMaxAckCipherLen, ACK_TIMEOUT_MS);
-    if (state != RADIOLIB_ERR_NONE) {
-        Serial.println("  no ACK received");
-        return false;
-    }
-
-    size_t ackCipherLen = radio.getPacketLength();
-    uint8_t ackPlainBuf[kMaxAckCipherLen];
-    size_t ackPlainLen = hcDecrypt(ackCipherBuf, ackCipherLen, ackPlainBuf);
-    if (ackPlainLen == 0) {
-        Serial.println("  ACK decrypt/auth failed");
-        return false;
-    }
-
-    char ackStr[32];
-    size_t copyLen = ackPlainLen < sizeof(ackStr) - 1 ? ackPlainLen : sizeof(ackStr) - 1;
-    memcpy(ackStr, ackPlainBuf, copyLen);
-    ackStr[copyLen] = '\0';
-
-    int ackId = -1;
-    if (sscanf(ackStr, "ACK,%d", &ackId) == 1 && ackId == expectedId) {
-        Serial.printf("  ACK received for id %d\n", ackId);
-        return true;
-    }
-
-    Serial.printf("  ACK mismatch or malformed: %s\n", ackStr);
-    return false;
-}
-
-// Encrypts and transmits a "<type>,<id>,<location>" packet, where type is
-// "OK" for a routine poll or "SOS" for a button-triggered emergency send,
-// and id lets waitForAck() match a reply to this specific send.
+// Encrypts and transmits a "<type>,<location>" packet, where type is "OK"
+// for a routine poll or "SOS" for a button-triggered emergency send.
 static void sendLocationPacket(const char *type) {
     displayWake();
     showStatus(type, "Sending...");
 
-    uint16_t msgId = nextMessageId++;
-    String payload = String(type) + "," + String(msgId) + "," + buildLocationMessage();
+    String payload = String(type) + "," + buildLocationMessage();
     Serial.print("TX (plaintext): ");
     Serial.println(payload);
 
@@ -275,12 +229,8 @@ static void sendLocationPacket(const char *type) {
 
     int state = radio.transmit(cipherBuf, cipherLen);
     if (state == RADIOLIB_ERR_NONE) {
-        Serial.println("  sent ok, waiting for ACK...");
-        if (waitForAck(msgId)) {
-            showStatus(type, "Delivered");
-        } else {
-            showStatus(type, "No ACK");
-        }
+        Serial.println("  sent ok");
+        showStatus(type, "Delivered");
     } else {
         Serial.printf("  send failed, code %d\n", state);
         showStatus(type, "Send failed");

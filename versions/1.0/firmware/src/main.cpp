@@ -6,8 +6,6 @@
 //
 // Target: LILYGO T-Beam Supreme (ESP32-S3, SX1262, AXP2101, GNSS)
 
-#include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h>
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
@@ -33,12 +31,6 @@ static constexpr int8_t LORA_TX_POWER_DBM = 17;
 // constant here so it's easy to tune once battery-life testing informs it.
 static constexpr uint32_t SEND_INTERVAL_MS = 60000;
 
-// How long to listen for an ACK after transmitting before giving up. This
-// blocks loop() (GPS/button polling included) for up to this long right
-// after a send -- acceptable since it only happens once per send, not
-// continuously.
-static constexpr uint32_t ACK_TIMEOUT_MS = 2000;
-
 // GPIO0 has no external debounce hardware on this board -- a plain
 // digitalRead() chatters across several transitions on every press/release.
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
@@ -56,13 +48,7 @@ TinyGPSPlus gps;
 
 SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
 
-static constexpr uint8_t DISPLAY_WIDTH = 128;
-static constexpr uint8_t DISPLAY_HEIGHT = 64;
-static constexpr uint8_t DISPLAY_I2C_ADDR = 0x3C;
-Adafruit_SH1106G display(DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, -1);
-
 uint32_t lastSendMs = 0;
-uint16_t nextMessageId = 0;
 
 // BUTTON_PIN uses INPUT_PULLUP, so idle-high/pressed-low.
 bool lastButtonReading = HIGH;
@@ -113,63 +99,6 @@ static void initGPS() {
     SerialGPS.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 }
 
-static void initDisplay() {
-    Wire.begin(I2C_SDA, I2C_SCL);
-    if (!display.begin(DISPLAY_I2C_ADDR, true)) {
-        haltWithError("Display init failed - check I2C wiring to SH1106");
-    }
-    display.clearDisplay();
-    display.display();
-}
-
-// Panel stays off between transmissions to save power -- it wakes for a
-// send, holds through the result, then sleeps again on a timer checked in
-// loop() (no delay() here, since that would stall GPS/button/radio polling).
-static constexpr uint32_t DISPLAY_HOLD_MS = 5000;
-bool displayOn = false;
-bool displayOffScheduled = false;
-uint32_t displayOffAtMs = 0;
-
-static void displayWake() {
-    if (!displayOn) {
-        display.oled_command(SH110X_DISPLAYON);
-        displayOn = true;
-    }
-    displayOffScheduled = false;
-}
-
-static void displaySleep() {
-    if (displayOn) {
-        display.oled_command(SH110X_DISPLAYOFF);
-        displayOn = false;
-    }
-    displayOffScheduled = false;
-}
-
-static void scheduleDisplayOff(uint32_t holdMs) {
-    displayOffAtMs = millis() + holdMs;
-    displayOffScheduled = true;
-}
-
-// line2 is the big/important word ("Sending", "Delivered", "Send failed");
-// line1 is the small context above it (message type, or a boot message).
-// No ACK yet (see FW-06 in the backlog), so "Delivered" here means "the
-// radio call returned success," not "a human received this."
-static void showStatus(const char *line1, const char *line2) {
-    display.clearDisplay();
-    display.setTextColor(SH110X_WHITE);
-
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.print(line1);
-
-    display.setTextSize(2);
-    display.setCursor(0, 20);
-    display.print(line2);
-
-    display.display();
-}
-
 static void initRadio() {
     SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN, RADIO_CS_PIN);
 
@@ -203,52 +132,10 @@ static String buildLocationMessage() {
     return message;
 }
 
-// Listens for up to ACK_TIMEOUT_MS for a reply matching "ACK,<expectedId>".
-// radio.receive() blocks (with the given timeout) and internally calls
-// readData() for us, so no separate startReceive()/interrupt dance is
-// needed here -- that pattern is only for continuous listening.
-static bool waitForAck(uint16_t expectedId) {
-    static constexpr size_t kMaxAckCipherLen = 64;
-    uint8_t ackCipherBuf[kMaxAckCipherLen];
-
-    int state = radio.receive(ackCipherBuf, kMaxAckCipherLen, ACK_TIMEOUT_MS);
-    if (state != RADIOLIB_ERR_NONE) {
-        Serial.println("  no ACK received");
-        return false;
-    }
-
-    size_t ackCipherLen = radio.getPacketLength();
-    uint8_t ackPlainBuf[kMaxAckCipherLen];
-    size_t ackPlainLen = hcDecrypt(ackCipherBuf, ackCipherLen, ackPlainBuf);
-    if (ackPlainLen == 0) {
-        Serial.println("  ACK decrypt/auth failed");
-        return false;
-    }
-
-    char ackStr[32];
-    size_t copyLen = ackPlainLen < sizeof(ackStr) - 1 ? ackPlainLen : sizeof(ackStr) - 1;
-    memcpy(ackStr, ackPlainBuf, copyLen);
-    ackStr[copyLen] = '\0';
-
-    int ackId = -1;
-    if (sscanf(ackStr, "ACK,%d", &ackId) == 1 && ackId == expectedId) {
-        Serial.printf("  ACK received for id %d\n", ackId);
-        return true;
-    }
-
-    Serial.printf("  ACK mismatch or malformed: %s\n", ackStr);
-    return false;
-}
-
-// Encrypts and transmits a "<type>,<id>,<location>" packet, where type is
-// "OK" for a routine poll or "SOS" for a button-triggered emergency send,
-// and id lets waitForAck() match a reply to this specific send.
+// Encrypts and transmits a "<type>,<location>" packet, where type is "OK"
+// for a routine poll or "SOS" for a button-triggered emergency send.
 static void sendLocationPacket(const char *type) {
-    displayWake();
-    showStatus(type, "Sending...");
-
-    uint16_t msgId = nextMessageId++;
-    String payload = String(type) + "," + String(msgId) + "," + buildLocationMessage();
+    String payload = String(type) + "," + buildLocationMessage();
     Serial.print("TX (plaintext): ");
     Serial.println(payload);
 
@@ -257,8 +144,6 @@ static void sendLocationPacket(const char *type) {
     size_t plainLen = payload.length();
     if (plainLen > kMaxPlaintextLen) {
         Serial.println("  payload too long for crypto buffer, dropping");
-        showStatus(type, "Send failed");
-        scheduleDisplayOff(DISPLAY_HOLD_MS);
         return;
     }
     memcpy(plainBuf, payload.c_str(), plainLen);
@@ -267,25 +152,16 @@ static void sendLocationPacket(const char *type) {
     size_t cipherLen = hcEncrypt(plainBuf, plainLen, cipherBuf);
     if (cipherLen == 0) {
         Serial.println("  encrypt failed");
-        showStatus(type, "Send failed");
-        scheduleDisplayOff(DISPLAY_HOLD_MS);
         return;
     }
     printHex("TX (over-the-air bytes): ", cipherBuf, cipherLen);
 
     int state = radio.transmit(cipherBuf, cipherLen);
     if (state == RADIOLIB_ERR_NONE) {
-        Serial.println("  sent ok, waiting for ACK...");
-        if (waitForAck(msgId)) {
-            showStatus(type, "Delivered");
-        } else {
-            showStatus(type, "No ACK");
-        }
+        Serial.println("  sent ok");
     } else {
         Serial.printf("  send failed, code %d\n", state);
-        showStatus(type, "Send failed");
     }
-    scheduleDisplayOff(DISPLAY_HOLD_MS);
 }
 
 // Debounces BUTTON_PIN and fires one SOS send per confirmed press. Runs
@@ -319,19 +195,11 @@ void setup() {
     initPower();
     initGPS();
     initRadio();
-    initDisplay();
 
-    displayWake();
-    showStatus("Hiker's Companion", "Ready");
-    scheduleDisplayOff(DISPLAY_HOLD_MS);
     Serial.println("Hiker's Companion - GPS/LoRa send loop ready");
 }
 
 void loop() {
-    if (displayOffScheduled && millis() >= displayOffAtMs) {
-        displaySleep();
-    }
-
     while (SerialGPS.available() > 0) {
         gps.encode(SerialGPS.read());
     }
