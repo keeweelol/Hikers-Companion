@@ -109,11 +109,25 @@ behind the ALDO3/ALDO4 rails, which are off at boot. `initPower()` in
 `main.cpp` turns them on — skip that step and the radio/GPS silently never
 power up even with correct wiring.
 
-Not yet verified on hardware: whether the USB CDC serial connection
-(`ARDUINO_USB_CDC_ON_BOOT=1`) survives repeated `esp_light_sleep_start()`
-calls without dropping/reconnecting on the host side. If `pio device
-monitor` disconnects each cycle once the sleep loop is flashed, that's why —
-worth checking before relying on continuous serial logs during testing.
+The display's I2C bus (`Wire`) needs a full re-init (`reinitDisplay()`)
+before every cycle's status draw, not just an ON command — unlike the
+GPS/LoRa rails, the display's own power is never cut, but the ESP32's I2C
+peripheral state doesn't reliably survive `esp_light_sleep_start()` either
+way. Without this the screen goes dark after the first sleep and stays dark
+even though GPS/LoRa/SOS keep working fine, since those get a full re-init
+already (their rails actually are cut). `reinitDisplay()` is non-fatal on
+failure, unlike `initDisplay()` at boot — a flaky display shouldn't halt the
+whole device the way a missing one at boot should.
+
+Confirmed, not just suspected: native USB CDC serial (`ARDUINO_USB_CDC_ON_BOOT=1`)
+is not reliable across sleep on this chip — RadioLib itself emits `"Use of
+USB CDC for debug output is not recommended (might stop on first sleep).
+Use hardware UART instead."` at compile time whenever that flag is set,
+sleep loop or not. If `pio device monitor` (or opening the COM port
+directly) stops working partway through testing, replug the USB-C cable to
+force Windows to re-enumerate it — don't rely on one continuous serial
+session surviving a full sleep cycle. A hardware UART-to-USB adapter would
+sidestep this if continuous logging becomes necessary.
 
 RadioLib's `setDio1Action()` (used for interrupt-driven receive, see
 `heltec-rx-test/`) fires on any rising edge on that pin — it doesn't know

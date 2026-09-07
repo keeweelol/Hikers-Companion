@@ -152,6 +152,25 @@ static void displayWake() {
     }
 }
 
+// Re-runs the I2C bus + SH1106 controller init before each cycle's display
+// writes. Unlike initDisplay() at boot, a failure here doesn't halt the
+// device -- GPS/LoRa/SOS need to keep working even if the screen can't be
+// brought back, and halting over a flaky display would be a far worse
+// failure mode than just a blank one. This exists because the display's
+// rail is never gated (only ALDO3/ALDO4 are), but the ESP32's own I2C
+// peripheral state isn't guaranteed to survive esp_light_sleep_start()
+// unrestored -- plain displayWake() alone left the screen dead after the
+// first light sleep even though the controller itself was never powered
+// down.
+static void reinitDisplay() {
+    Wire.begin(I2C_SDA, I2C_SCL);
+    if (display.begin(DISPLAY_I2C_ADDR, true)) {
+        displayOn = true; // begin() unconditionally leaves the OLED powered on
+    } else {
+        Serial.println("  display re-init failed, continuing without it");
+    }
+}
+
 static void displaySleep() {
     if (displayOn) {
         display.oled_command(SH110X_DISPLAYOFF);
@@ -333,7 +352,7 @@ static bool waitForAck(uint16_t expectedId) {
 // "OK" for a routine poll or "SOS" for a button-triggered emergency send,
 // and id lets waitForAck() match a reply to this specific send.
 static void sendLocationPacket(const char *type) {
-    displayWake();
+    reinitDisplay();
     showStatus(type, "Sending...");
 
     uint16_t msgId = nextMessageId++;
