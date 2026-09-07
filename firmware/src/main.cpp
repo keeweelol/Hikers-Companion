@@ -18,6 +18,7 @@
 #include <driver/gpio.h>
 #include <esp_sleep.h>
 
+#include "ble_provisioning.h"
 #include "hc_crypto.h"
 #include "pins.h"
 
@@ -90,6 +91,14 @@ uint32_t lastButtonChangeMs = 0;
 // back to routine sends. A second press cancels it.
 bool sosActive = false;
 
+// Set the moment SOS activates, consumed by the very next SOS send (see
+// sendLocationPacket()), then cleared -- so the emergency contact list rides
+// along on just that first packet, not every repeat of the standing beacon.
+// Left alone (not cleared) by a routine "OK" send, so if SOS gets canceled
+// before it ever actually transmits, the contacts are still attached to
+// whichever SOS send eventually happens next.
+bool sosContactsPending = false;
+
 static void printHex(const char *label, const uint8_t *data, size_t len) {
     Serial.print(label);
     for (size_t i = 0; i < len; i++) {
@@ -121,6 +130,17 @@ static void initPower() {
 
     PMU->setPowerChannelVoltage(XPOWERS_ALDO4, 3300); // GPS rail
     PMU->enablePowerOutput(XPOWERS_ALDO4);
+
+    // The board's physical PWR button isn't a GPIO at all -- it's wired
+    // into the AXP2101 as its "power key," which reports presses by
+    // pulling PMU_IRQ_PIN low. Disabling every other IRQ source means that
+    // pin can only go low for one reason, so bluetoothButtonPressed() can
+    // treat "pin is low" as "PWR was short-pressed" without decoding the
+    // status register further.
+    PMU->disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
+    PMU->clearIrqStatus();
+    PMU->enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ);
+    pinMode(PMU_IRQ_PIN, INPUT_PULLUP);
 }
 
 static void initGPS() {
@@ -248,20 +268,23 @@ static void radioRailUp() {
     initRadio();
 }
 
-// Light-sleeps the ESP32 for durationMs, or until BUTTON_PIN is pressed,
-// whichever comes first -- SOS needs to interrupt the wait immediately
-// rather than sit out the rest of a ~60s sleep. esp_light_sleep_start()
-// preserves RAM and peripheral state (unlike deep sleep), so there's nothing
-// else here that needs saving/restoring around it.
+// Light-sleeps the ESP32 for durationMs, or until BUTTON_PIN (SOS) or
+// PMU_IRQ_PIN (the PWR/Bluetooth button) is pressed, whichever comes first --
+// both need to interrupt the wait immediately rather than sit out the rest
+// of a ~60s sleep. esp_light_sleep_start() preserves RAM and peripheral
+// state (unlike deep sleep), so there's nothing else here that needs
+// saving/restoring around it.
 static void lightSleepMs(uint32_t durationMs) {
     esp_sleep_enable_timer_wakeup((uint64_t)durationMs * 1000ULL);
 
     gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)PMU_IRQ_PIN, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
 
     esp_light_sleep_start();
 
     gpio_wakeup_disable((gpio_num_t)BUTTON_PIN);
+    gpio_wakeup_disable((gpio_num_t)PMU_IRQ_PIN);
 }
 
 static void holdDisplayThenSleep() {
@@ -291,7 +314,46 @@ static bool buttonPressed() {
 
 static void handleButtonPress() {
     sosActive = !sosActive;
+    if (sosActive) {
+        sosContactsPending = true; // only the next SOS send carries the stored contacts
+    }
     Serial.println(sosActive ? "SOS button pressed - beacon started" : "SOS button pressed - beacon canceled");
+}
+
+// PMU_IRQ_PIN only ever goes low for a PWR short-press -- see initPower(),
+// which disables every other AXP2101 IRQ source -- so this is a plain level
+// read, no debounce needed the way BUTTON_PIN needs one: the AXP2101 has
+// already qualified the press itself before raising the IRQ. clearIrqStatus()
+// releases the line back high; skipping it would leave PMU_IRQ_PIN stuck low
+// and this function permanently "pressed."
+static bool bluetoothButtonPressed() {
+    if (digitalRead(PMU_IRQ_PIN) != LOW) {
+        return false;
+    }
+    PMU->getIrqStatus();
+    bool shortPress = PMU->isPekeyShortPressIrq();
+    PMU->clearIrqStatus();
+    return shortPress;
+}
+
+// A separate physical button from SOS (BUTTON_PIN) on purpose, so pulling up
+// contacts on the fly can never be mistaken for -- or interfere with -- the
+// emergency button. Entering provisioning blocks the loop for potentially
+// minutes (until a phone connects and finishes, or the idle timeout), so a
+// press is flatly ignored whenever the SOS beacon is active rather than
+// queued for later -- an active SOS beacon must keep beaconing every cycle,
+// not go quiet while someone edits contacts. Never returns if it does enter,
+// since runProvisioningMode() itself only returns via esp_restart().
+static void checkBluetoothButton() {
+    if (!bluetoothButtonPressed()) {
+        return;
+    }
+    if (sosActive) {
+        Serial.println("PWR button pressed - ignored, SOS beacon is active");
+        return;
+    }
+    Serial.println("PWR button pressed - entering BLE provisioning");
+    runProvisioningMode();
 }
 
 // Builds "lat,lng,hdop,age_ms" or "NOFIX,age_ms" if we don't have a valid fix yet.
@@ -348,19 +410,39 @@ static bool waitForAck(uint16_t expectedId) {
     return false;
 }
 
-// Encrypts and transmits a "<type>,<id>,<location>" packet, where type is
-// "OK" for a routine poll or "SOS" for a button-triggered emergency send,
-// and id lets waitForAck() match a reply to this specific send.
+// Encrypts and transmits a "<type>,<id>,<location>[,<contacts>]" packet,
+// where type is "OK" for a routine poll or "SOS" for a button-triggered
+// emergency send, and id lets waitForAck() match a reply to this specific
+// send. The trailing <contacts> field (see buildContactsForSos() in
+// ble_provisioning.cpp) is appended only once -- on the first send after SOS
+// activates (sosContactsPending) -- not on every repeat of a standing SOS
+// beacon, so responders learn who to notify without re-sending that data on
+// every ~60s heartbeat. If it wouldn't fit alongside the location, it's
+// dropped and the location-only packet still goes out: the location itself
+// must never fail to send just because someone's stored contact names ran
+// long.
 static void sendLocationPacket(const char *type) {
     reinitDisplay();
     showStatus(type, "Sending...");
 
     uint16_t msgId = nextMessageId++;
     String payload = String(type) + "," + String(msgId) + "," + buildLocationMessage();
+
+    static constexpr size_t kMaxPlaintextLen = 160;
+
+    if (sosActive && sosContactsPending) {
+        String withContacts = payload + "," + buildContactsForSos();
+        if (withContacts.length() <= kMaxPlaintextLen) {
+            payload = withContacts;
+        } else {
+            Serial.println("  contacts too long to fit with location, sending location only");
+        }
+        sosContactsPending = false;
+    }
+
     Serial.print("TX (plaintext): ");
     Serial.println(payload);
 
-    static constexpr size_t kMaxPlaintextLen = 64;
     uint8_t plainBuf[kMaxPlaintextLen];
     size_t plainLen = payload.length();
     if (plainLen > kMaxPlaintextLen) {
@@ -414,6 +496,7 @@ static void acquireGpsFix(uint32_t budgetMs) {
             handleButtonPress();
             return; // don't make an SOS press wait out the rest of the budget
         }
+        checkBluetoothButton(); // never returns if it enters provisioning
     }
 }
 
@@ -422,6 +505,15 @@ void setup() {
     delay(1500); // let USB CDC come up before first prints
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    // Checked before anything else touches power rails or radios: holding
+    // BOOT through power-on is the only way into BLE provisioning (FW-10),
+    // so normal operation never has BLE running and doesn't touch the
+    // sleep/power budget FW-12 was built around. runProvisioningMode()
+    // itself never returns -- it esp_restart()s when done.
+    if (bootButtonHeldForProvisioning()) {
+        runProvisioningMode();
+    }
 
     initPower();
     initGPS();
@@ -434,7 +526,10 @@ void setup() {
     holdDisplayThenSleep();
 }
 
-// One cycle is: check for a pending SOS press, acquire a GPS fix (bounded),
+// One cycle is: check for a pending SOS press, check for a pending
+// Bluetooth-button press (see checkBluetoothButton() -- ignored outright
+// while SOS is active, otherwise this is where a routine "OK" cycle gets
+// interrupted for on-the-fly contact editing), acquire a GPS fix (bounded),
 // send, then gate the GPS/LoRa rails off and light-sleep for whatever's left
 // of SEND_INTERVAL_MS -- not a fixed sleep after a fixed acquire, since the
 // acquire+send stretch is itself variable and this keeps the overall cycle
@@ -447,6 +542,7 @@ void loop() {
     if (buttonPressed()) {
         handleButtonPress();
     }
+    checkBluetoothButton(); // never returns if it enters provisioning
 
     acquireGpsFix(sosActive ? GPS_ACQUIRE_QUICK_MS : GPS_ACQUIRE_BUDGET_MS);
     sendLocationPacket(sosActive ? "SOS" : "OK");

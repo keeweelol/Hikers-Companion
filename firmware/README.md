@@ -65,6 +65,108 @@ wakeup on the SOS button (level-triggered, since ESP32-S3 light sleep GPIO
 wakeup only supports level triggers) so a press doesn't have to wait out the
 rest of a ~60s sleep.
 
+## BLE provisioning (FW-10)
+
+Two ways in:
+
+- **At power-on**: holding BOOT through boot (2s, `PROVISION_HOLD_MS`) skips
+  the normal GPS/LoRa loop entirely and boots straight into a standalone
+  provisioning mode (`bootButtonHeldForProvisioning()` in `main.cpp`).
+- **On the fly, during normal operation**: short-pressing the board's
+  physical PWR button (`checkBluetoothButton()`/`bluetoothButtonPressed()`
+  in `main.cpp`) drops straight into provisioning mid-loop, without a
+  reboot. PWR isn't a GPIO on this board — it's wired into the AXP2101 PMU
+  as its "power key," reported via `PMU_IRQ_PIN` going low — so it's a
+  physically separate button from BOOT/`BUTTON_PIN` (SOS) on purpose: a
+  contact-editing press can never be mistaken for, or interfere with, the
+  emergency button. **Ignored outright whenever the SOS beacon is active**
+  (`sosActive`) rather than queued — entering provisioning can block the
+  loop for minutes, and an active SOS beacon has to keep beaconing every
+  cycle, not go quiet while someone edits contacts. When SOS isn't active,
+  a PWR press is checked at the top of `loop()`, inside `acquireGpsFix()`'s
+  polling loop, and as a light-sleep wakeup source, so it can interrupt a
+  routine "OK" cycle at any point except the ~2s send/ACK-wait window
+  itself.
+
+Either way, `runProvisioningMode()` never returns — normal operation never
+runs BLE, so it doesn't touch the sleep/power budget the Power section
+above depends on.
+
+In provisioning mode the device advertises as `HikerComp-XXXX` (last 4 hex
+digits of its MAC, so multiple units on the bench are distinguishable)
+implementing the Nordic UART Service (NUS) — the de facto standard a
+terminal-style BLE app (Serial Bluetooth Terminal, nRF Connect's UART
+preset, Adafruit Bluefruit Connect, etc.) auto-detects and treats as a
+plain serial link, so provisioning is "type a command, see a reply" rather
+than hand-browsing a raw GATT table. No dedicated companion app exists yet
+(see FW-11).
+
+The OLED reflects connection state throughout — "Bluetooth / No Device"
+while advertising, flipping to "Bluetooth / Connected" as soon as a phone
+connects (polled from `clientConnected` in `runProvisioningMode()`'s loop
+rather than drawn from inside the NimBLE connect/disconnect callbacks
+themselves, so every display write stays on one task). Unlike normal
+operation, the display is never put to sleep in this mode — it stays lit
+for the whole session, since provisioning is a short, deliberate, plugged-in
+bench activity rather than something to optimize for battery life.
+
+One command per line on the RX characteristic, one text reply per line back
+over TX (`sendLine()`/`RxCallbacks::onWrite()` in `src/ble_provisioning.cpp`):
+
+- `<slot 0-2>|<name>|<phone>` — store one of up to 3 emergency contacts.
+  Replies `OK: stored slot <n>`.
+- `LIST` — replies with all 3 slots as `<slot>:<name>:<phone>` lines,
+  confirming what's actually stored.
+- `CLEAR` — wipes all 3 slots.
+- `DONE` — ends the session immediately instead of waiting on a disconnect.
+- Anything else gets an `ERR: ...` reply rather than being silently dropped,
+  since a human is typing these by hand.
+
+Contacts are backed by NVS (`Preferences`, namespace `hc_contacts`) so they
+survive a reboot; each slot is its own pair of keys so a write to one can't
+corrupt another.
+
+A session also ends on a phone disconnect (one provisioning session per
+boot-hold — walking away doesn't leave the device re-advertising), on a
+second BOOT press, or after `PROVISION_IDLE_TIMEOUT_MS` (3 min) if no phone
+ever connects. Either way `runProvisioningMode()` finishes with
+`esp_restart()` back into normal firmware — there's no in-place return path.
+
+**Not implemented:** pairing is unauthenticated (BLE "Just Works", no
+passkey/bonding) — same simple-for-now tradeoff as the LoRa PSK being baked
+into firmware, acceptable for bench hardware the team controls but not
+before this leaves the bench.
+
+### Contacts over LoRa
+
+The stored contacts do go out over LoRa now, but only once per SOS
+activation, not on every repeat. Pressing SOS sets `sosContactsPending`
+(`main.cpp`); the very next `sendLocationPacket()` call appends
+`,<buildContactsForSos()>` — a compact `name:phone;name:phone;...` summary,
+empty slots skipped — to that one packet and clears the flag, so every
+later repeat of a standing SOS beacon goes back to being location-only.
+Canceling SOS before it ever actually transmits leaves the flag set rather
+than clearing it, so contacts still ride along on whichever SOS send
+eventually happens next.
+
+This is a deliberate one-shot, not a bug: sending the full contact list on
+every ~60s beacon repeat would waste airtime on data that essentially never
+changes mid-emergency, when responders only need to learn it once. If the
+combined location+contacts string would overflow the crypto buffer
+(`kMaxPlaintextLen`, now 160 bytes — raised from the location-only packet's
+64 specifically to fit this), the contacts are dropped for that send and
+the location goes out alone instead — the location must never fail to send
+just because someone's stored contact names ran long.
+
+Raising `kMaxPlaintextLen` also raises the ciphertext size on the air
+(`+ HC_GCM_NONCE_LEN + HC_GCM_TAG_LEN` = up to 188 bytes now, versus 92
+before), which is why `heltec-rx-test/src/main.cpp`'s own receive buffer
+(`kMaxCipherLen`) had to move from 128 to 192 alongside it — a packet larger
+than the receiver's buffer gets silently dropped as "bad packet length"
+rather than received. The two constants have to be kept in sync by hand;
+there's no shared source of truth between the two PlatformIO projects for
+this.
+
 ## Build / flash
 
 ```sh
@@ -108,6 +210,16 @@ The T-Beam Supreme's AXP2101 PMU gates power to the LoRa and GPS modules
 behind the ALDO3/ALDO4 rails, which are off at boot. `initPower()` in
 `main.cpp` turns them on — skip that step and the radio/GPS silently never
 power up even with correct wiring.
+
+The board's PWR button isn't a GPIO at all — it's wired into the AXP2101 as
+its power key, reported by pulling `PMU_IRQ_PIN` low. `initPower()`
+disables every other AXP2101 IRQ source and enables only
+`XPOWERS_AXP2101_PKEY_SHORT_IRQ`, so `bluetoothButtonPressed()` can treat
+"pin is low" as "PWR was pressed" without decoding the status register —
+if another IRQ source ever gets enabled here for something else, that
+assumption breaks and the pin could go low for an unrelated reason.
+`PMU->clearIrqStatus()` must be called after reading a press or the pin
+stays stuck low and every subsequent check reads as a phantom press.
 
 The display's I2C bus (`Wire`) needs a full re-init (`reinitDisplay()`)
 before every cycle's status draw, not just an ON command — unlike the
