@@ -1,8 +1,9 @@
-// Hiker's Companion — Milestone 1 firmware
+// Hiker's Companion firmware
 //
-// Reads GPS location and transmits it over LoRa on a fixed interval.
-// No button/SOS logic or display yet — this exists to prove the GPS -> LoRa
-// path works end to end on real hardware before building the full SOS flow.
+// Reads GPS location and transmits it over LoRa on a fixed interval, with an
+// SOS button, OLED status display, and delivery ACK. Between sends the
+// GPS/LoRa PMU rails are gated off and the ESP32 light-sleeps (see loop()) —
+// that duty cycle is what the report's average current draw is based on.
 //
 // Target: LILYGO T-Beam Supreme (ESP32-S3, SX1262, AXP2101, GNSS)
 
@@ -14,6 +15,8 @@
 #include <RadioLib.h>
 #include <TinyGPS++.h>
 #include <XPowersLib.h>
+#include <driver/gpio.h>
+#include <esp_sleep.h>
 
 #include "hc_crypto.h"
 #include "pins.h"
@@ -43,6 +46,20 @@ static constexpr uint32_t ACK_TIMEOUT_MS = 2000;
 // digitalRead() chatters across several transitions on every press/release.
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
 
+// GPS and the LoRa radio are only powered for the acquire+send window each
+// cycle (see gpsRailUp()/radioRailUp() and the light sleep in loop()) --
+// unlike milestone 1's always-on loop, this is a cold GPS acquisition every
+// cycle, not a running fix. 25s is a placeholder budget pending real TTFF
+// measurements on this module, same caveat as the other timing constants.
+static constexpr uint32_t GPS_ACQUIRE_BUDGET_MS = 25000;
+
+// An SOS press gets a much shorter acquisition window than a routine poll --
+// getting the packet on the air fast matters more than a precise fix, and a
+// hiker who just hit the button shouldn't wait out the full budget above.
+// buildLocationMessage() still reports whatever fix (possibly stale, or
+// none) TinyGPSPlus has on hand either way.
+static constexpr uint32_t GPS_ACQUIRE_QUICK_MS = 2000;
+
 // ---- Globals ---------------------------------------------------------
 // XPowersAXP2101's power-control methods are only public through the
 // XPowersLibInterface base -- the concrete class re-declares them protected,
@@ -61,7 +78,6 @@ static constexpr uint8_t DISPLAY_HEIGHT = 64;
 static constexpr uint8_t DISPLAY_I2C_ADDR = 0x3C;
 Adafruit_SH1106G display(DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, -1);
 
-uint32_t lastSendMs = 0;
 uint16_t nextMessageId = 0;
 
 // BUTTON_PIN uses INPUT_PULLUP, so idle-high/pressed-low.
@@ -123,19 +139,17 @@ static void initDisplay() {
 }
 
 // Panel stays off between transmissions to save power -- it wakes for a
-// send, holds through the result, then sleeps again on a timer checked in
-// loop() (no delay() here, since that would stall GPS/button/radio polling).
+// send and holds through the result via holdDisplayThenSleep() below, which
+// light-sleeps for the hold instead of delay()ing so it isn't a needless
+// full-power stretch either.
 static constexpr uint32_t DISPLAY_HOLD_MS = 5000;
 bool displayOn = false;
-bool displayOffScheduled = false;
-uint32_t displayOffAtMs = 0;
 
 static void displayWake() {
     if (!displayOn) {
         display.oled_command(SH110X_DISPLAYON);
         displayOn = true;
     }
-    displayOffScheduled = false;
 }
 
 static void displaySleep() {
@@ -143,12 +157,6 @@ static void displaySleep() {
         display.oled_command(SH110X_DISPLAYOFF);
         displayOn = false;
     }
-    displayOffScheduled = false;
-}
-
-static void scheduleDisplayOff(uint32_t holdMs) {
-    displayOffAtMs = millis() + holdMs;
-    displayOffScheduled = true;
 }
 
 // line2 is the big/important word ("Sending", "Delivered", "Send failed");
@@ -184,6 +192,87 @@ static void initRadio() {
     radio.setSpreadingFactor(LORA_SPREADING_FACTOR);
     radio.setCodingRate(LORA_CODING_RATE);
     radio.setOutputPower(LORA_TX_POWER_DBM);
+}
+
+// LoRa rail (ALDO3) and GPS rail (ALDO4) are the same PMU outputs initPower()
+// turns on at boot -- cut them here whenever GPS/radio have nothing to do
+// (the light sleep in loop()) instead of leaving both powered for the full
+// ~60s interval the way milestone 1 did.
+static void gpsRailDown() {
+    digitalWrite(GPS_EN_PIN, LOW); // avoid driving EN into an otherwise-unpowered GPS chip
+    PMU->disablePowerOutput(XPOWERS_ALDO4);
+}
+
+static void radioRailDown() {
+    PMU->disablePowerOutput(XPOWERS_ALDO3);
+}
+
+// The SX1262 and the GPS module both lose all internal state when their
+// rail is cut, so bringing a rail back up means a full re-init, not just
+// flipping the PMU output back on -- reuses the same init*() setup() calls.
+// The delay() after each enablePowerOutput() is a conservative placeholder
+// for AXP2101 rail ramp-up before touching the chip on it over SPI/I2C --
+// initPower() gets this for free at boot from the setup steps that run
+// after it, but here initGPS()/initRadio() would otherwise run immediately
+// on a rail that was just re-enabled. Not measured against real hardware.
+static void gpsRailUp() {
+    PMU->setPowerChannelVoltage(XPOWERS_ALDO4, 3300);
+    PMU->enablePowerOutput(XPOWERS_ALDO4);
+    delay(10);
+    initGPS();
+}
+
+static void radioRailUp() {
+    PMU->setPowerChannelVoltage(XPOWERS_ALDO3, 3300);
+    PMU->enablePowerOutput(XPOWERS_ALDO3);
+    delay(10);
+    initRadio();
+}
+
+// Light-sleeps the ESP32 for durationMs, or until BUTTON_PIN is pressed,
+// whichever comes first -- SOS needs to interrupt the wait immediately
+// rather than sit out the rest of a ~60s sleep. esp_light_sleep_start()
+// preserves RAM and peripheral state (unlike deep sleep), so there's nothing
+// else here that needs saving/restoring around it.
+static void lightSleepMs(uint32_t durationMs) {
+    esp_sleep_enable_timer_wakeup((uint64_t)durationMs * 1000ULL);
+
+    gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+
+    esp_light_sleep_start();
+
+    gpio_wakeup_disable((gpio_num_t)BUTTON_PIN);
+}
+
+static void holdDisplayThenSleep() {
+    lightSleepMs(DISPLAY_HOLD_MS);
+    displaySleep();
+}
+
+// Debounces BUTTON_PIN and reports one confirmed press per press/release
+// cycle (BUTTON_PIN uses INPUT_PULLUP, so idle-high/pressed-low). Polled
+// rather than interrupt-driven so it fits the same simple model as GPS
+// acquisition below; separated from acting on the press so both the
+// acquisition loop and the top of loop() can check for one without
+// duplicating the toggle logic.
+static bool buttonPressed() {
+    bool reading = digitalRead(BUTTON_PIN);
+    if (reading != lastButtonReading) {
+        lastButtonChangeMs = millis();
+        lastButtonReading = reading;
+    }
+
+    if (millis() - lastButtonChangeMs > BUTTON_DEBOUNCE_MS && reading != buttonState) {
+        buttonState = reading;
+        return buttonState == LOW;
+    }
+    return false;
+}
+
+static void handleButtonPress() {
+    sosActive = !sosActive;
+    Serial.println(sosActive ? "SOS button pressed - beacon started" : "SOS button pressed - beacon canceled");
 }
 
 // Builds "lat,lng,hdop,age_ms" or "NOFIX,age_ms" if we don't have a valid fix yet.
@@ -258,7 +347,7 @@ static void sendLocationPacket(const char *type) {
     if (plainLen > kMaxPlaintextLen) {
         Serial.println("  payload too long for crypto buffer, dropping");
         showStatus(type, "Send failed");
-        scheduleDisplayOff(DISPLAY_HOLD_MS);
+        holdDisplayThenSleep();
         return;
     }
     memcpy(plainBuf, payload.c_str(), plainLen);
@@ -268,7 +357,7 @@ static void sendLocationPacket(const char *type) {
     if (cipherLen == 0) {
         Serial.println("  encrypt failed");
         showStatus(type, "Send failed");
-        scheduleDisplayOff(DISPLAY_HOLD_MS);
+        holdDisplayThenSleep();
         return;
     }
     printHex("TX (over-the-air bytes): ", cipherBuf, cipherLen);
@@ -285,27 +374,26 @@ static void sendLocationPacket(const char *type) {
         Serial.printf("  send failed, code %d\n", state);
         showStatus(type, "Send failed");
     }
-    scheduleDisplayOff(DISPLAY_HOLD_MS);
+    holdDisplayThenSleep();
 }
 
-// Debounces BUTTON_PIN and fires one SOS send per confirmed press. Runs
-// every loop() iteration rather than off an interrupt -- at this poll rate
-// missing a press by a millisecond or two doesn't matter, and it keeps the
-// button on the same simple polling model as everything else in loop().
-static void pollButton() {
-    bool reading = digitalRead(BUTTON_PIN);
-    if (reading != lastButtonReading) {
-        lastButtonChangeMs = millis();
-        lastButtonReading = reading;
-    }
-
-    if (millis() - lastButtonChangeMs > BUTTON_DEBOUNCE_MS && reading != buttonState) {
-        buttonState = reading;
-        if (buttonState == LOW) {
-            sosActive = !sosActive;
-            Serial.println(sosActive ? "SOS button pressed - beacon started" : "SOS button pressed - beacon canceled");
-            sendLocationPacket(sosActive ? "SOS" : "OK");
-            lastSendMs = millis(); // don't also fire the routine send right after
+// Feeds GPS UART bytes to the parser until a fresh fix shows up or budgetMs
+// runs out, whichever is first. GPS is powered down between cycles (see
+// gpsRailDown()), so this is a cold acquisition every time, not a running
+// fix -- buildLocationMessage() falls back to whatever fix (possibly stale,
+// or none) TinyGPSPlus still has on hand if this times out.
+static void acquireGpsFix(uint32_t budgetMs) {
+    uint32_t start = millis();
+    while (millis() - start < budgetMs) {
+        while (SerialGPS.available() > 0) {
+            gps.encode(SerialGPS.read());
+        }
+        if (gps.location.isValid() && gps.location.age() < 2000) {
+            return;
+        }
+        if (buttonPressed()) {
+            handleButtonPress();
+            return; // don't make an SOS press wait out the rest of the budget
         }
     }
 }
@@ -323,24 +411,34 @@ void setup() {
 
     displayWake();
     showStatus("Hiker's Companion", "Ready");
-    scheduleDisplayOff(DISPLAY_HOLD_MS);
     Serial.println("Hiker's Companion - GPS/LoRa send loop ready");
+    holdDisplayThenSleep();
 }
 
+// One cycle is: check for a pending SOS press, acquire a GPS fix (bounded),
+// send, then gate the GPS/LoRa rails off and light-sleep for whatever's left
+// of SEND_INTERVAL_MS -- not a fixed sleep after a fixed acquire, since the
+// acquire+send stretch is itself variable and this keeps the overall cycle
+// close to SEND_INTERVAL_MS regardless. This is the duty cycle the report's
+// 46.93 mA average assumes; the milestone-1 loop this replaced kept the
+// CPU, GPS, and radio all fully awake for the entire interval instead.
 void loop() {
-    if (displayOffScheduled && millis() >= displayOffAtMs) {
-        displaySleep();
+    uint32_t cycleStartMs = millis();
+
+    if (buttonPressed()) {
+        handleButtonPress();
     }
 
-    while (SerialGPS.available() > 0) {
-        gps.encode(SerialGPS.read());
-    }
+    acquireGpsFix(sosActive ? GPS_ACQUIRE_QUICK_MS : GPS_ACQUIRE_BUDGET_MS);
+    sendLocationPacket(sosActive ? "SOS" : "OK");
 
-    pollButton();
+    gpsRailDown();
+    radioRailDown();
 
-    uint32_t now = millis();
-    if (now - lastSendMs >= SEND_INTERVAL_MS) {
-        lastSendMs = now;
-        sendLocationPacket(sosActive ? "SOS" : "OK");
-    }
+    uint32_t elapsedMs = millis() - cycleStartMs;
+    uint32_t sleepMs = elapsedMs < SEND_INTERVAL_MS ? SEND_INTERVAL_MS - elapsedMs : 0;
+    lightSleepMs(sleepMs);
+
+    gpsRailUp();
+    radioRailUp();
 }

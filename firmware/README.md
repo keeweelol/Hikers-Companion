@@ -26,7 +26,7 @@ Reads GPS fixes and transmits location over LoRa on a timer. The onboard
 BOOT button (GPIO0) toggles a standing SOS beacon: pressing it sends an
 immediate "SOS"-flagged packet and switches every subsequent periodic send
 to "SOS" too (instead of the routine "OK") until pressed again to cancel —
-see `sendLocationPacket()` / `pollButton()` in `src/main.cpp`.
+see `sendLocationPacket()` / `buttonPressed()` in `src/main.cpp`.
 
 An SH1106 OLED (I2C, pins 17/18) shows live status via `showStatus()`:
 message type on top, "Sending" / "Delivered" / "No ACK" / "Send failed"
@@ -39,7 +39,31 @@ call itself errored, not that nobody answered.
 
 The panel stays off between transmissions to save power — it wakes for a
 send and holds for `DISPLAY_HOLD_MS` (5s) after the result, then sleeps
-again (`displayWake()`/`displaySleep()`, timer checked in `loop()`).
+again (`displayWake()`/`displaySleep()`).
+
+## Power
+
+Between sends, the LoRa and GPS PMU rails (ALDO3/ALDO4) are cut and the
+ESP32 goes into light sleep, instead of both rails and the CPU staying fully
+awake for the whole `SEND_INTERVAL_MS` interval — this duty cycle is what
+the report's 46.93 mA average current draw is based on. Each cycle in
+`loop()`:
+
+1. Check for a pending SOS press (`buttonPressed()`/`handleButtonPress()`).
+2. Power the GPS/LoRa rails back on and acquire a fix (`acquireGpsFix()`,
+   bounded by `GPS_ACQUIRE_BUDGET_MS` for a routine poll or the much shorter
+   `GPS_ACQUIRE_QUICK_MS` for an SOS press — a fresh fix isn't worth making
+   an emergency send wait).
+3. Send (`sendLocationPacket()`).
+4. Gate the rails back off (`gpsRailDown()`/`radioRailDown()`) and light-sleep
+   for whatever's left of the ~60s interval (`lightSleepMs()`).
+
+The SX1262 and the GPS module both lose all internal state when their rail
+is cut, so `gpsRailUp()`/`radioRailUp()` do a full re-init (`initGPS()`/
+`initRadio()`), not just a PMU output toggle. The sleep also arms a GPIO
+wakeup on the SOS button (level-triggered, since ESP32-S3 light sleep GPIO
+wakeup only supports level triggers) so a press doesn't have to wait out the
+rest of a ~60s sleep.
 
 ## Build / flash
 
@@ -85,6 +109,12 @@ behind the ALDO3/ALDO4 rails, which are off at boot. `initPower()` in
 `main.cpp` turns them on — skip that step and the radio/GPS silently never
 power up even with correct wiring.
 
+Not yet verified on hardware: whether the USB CDC serial connection
+(`ARDUINO_USB_CDC_ON_BOOT=1`) survives repeated `esp_light_sleep_start()`
+calls without dropping/reconnecting on the host side. If `pio device
+monitor` disconnects each cycle once the sleep loop is flashed, that's why —
+worth checking before relying on continuous serial logs during testing.
+
 RadioLib's `setDio1Action()` (used for interrupt-driven receive, see
 `heltec-rx-test/`) fires on any rising edge on that pin — it doesn't know
 whether the chip currently means RX-done or TX-done by it. Any
@@ -97,3 +127,5 @@ packet — see the comment on `sendAck()` in `heltec-rx-test/src/main.cpp`.
 ## Next milestones (not yet implemented)
 
 - Power measurement against the report's theoretical current-draw numbers
+  now that the sleep/rail-gating duty cycle (see Power, above) is in place
+  to measure
