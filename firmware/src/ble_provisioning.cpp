@@ -34,7 +34,12 @@ constexpr char TX_CHAR_UUID[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
 constexpr uint8_t DISPLAY_WIDTH = 128;
 constexpr uint8_t DISPLAY_HEIGHT = 64;
-constexpr uint8_t DISPLAY_I2C_ADDR = 0x3C;
+
+// LilyGO ships this board with two magnetometer sub-variants (QMC6310U vs
+// QMC6310N) that put the SH1106 OLED at different I2C addresses -- 0x3C or
+// 0x3D respectively (see the T-Beam Supreme hardware doc) -- same reason
+// main.cpp's initDisplay() probes both instead of assuming one.
+constexpr uint8_t DISPLAY_I2C_ADDR_CANDIDATES[] = {0x3C, 0x3D};
 
 // Unauthenticated on purpose for now, same tradeoff as the LoRa PSK in
 // shared/hc_crypto.h being baked into firmware: this is a feasibility MVP
@@ -234,7 +239,13 @@ void runProvisioningMode() {
     // which are wired into the normal-operation sleep cycle.
     Wire.begin(I2C_SDA, I2C_SCL);
     Adafruit_SH1106G display(DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, -1);
-    bool hasDisplay = display.begin(DISPLAY_I2C_ADDR, true);
+    bool hasDisplay = false;
+    for (uint8_t addr : DISPLAY_I2C_ADDR_CANDIDATES) {
+        if (display.begin(addr, true)) {
+            hasDisplay = true;
+            break;
+        }
+    }
     if (hasDisplay) {
         display.clearDisplay();
         display.display();

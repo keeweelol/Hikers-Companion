@@ -76,8 +76,23 @@ SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUS
 
 static constexpr uint8_t DISPLAY_WIDTH = 128;
 static constexpr uint8_t DISPLAY_HEIGHT = 64;
-static constexpr uint8_t DISPLAY_I2C_ADDR = 0x3C;
+
+// LilyGO ships this exact board with two magnetometer sub-variants
+// (QMC6310U vs QMC6310N) that put the SH1106 OLED at different I2C
+// addresses -- 0x3C or 0x3D respectively (see the T-Beam Supreme hardware
+// doc). Two physical units on the bench can genuinely need different
+// addresses here; initDisplay() probes both rather than assuming one.
+static constexpr uint8_t DISPLAY_I2C_ADDR_CANDIDATES[] = {0x3C, 0x3D};
 Adafruit_SH1106G display(DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, -1);
+
+// Set once initDisplay() finds a display that actually responds, at
+// whichever of the two candidate addresses worked -- reinitDisplay() then
+// reuses this instead of re-probing both every cycle. False for the whole
+// run if neither address ever responded (no display present or a genuinely
+// dead one), in which case every display* function below becomes a no-op
+// rather than touching hardware that isn't there.
+bool displayAvailable = false;
+uint8_t displayI2cAddr = DISPLAY_I2C_ADDR_CANDIDATES[0];
 
 uint16_t nextMessageId = 0;
 
@@ -149,13 +164,22 @@ static void initGPS() {
     SerialGPS.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 }
 
+// Non-fatal on failure, unlike initPower()/initRadio() -- GPS/LoRa/SOS must
+// keep working even with a dead or undetectable display, since this is a
+// safety device first and a status screen second. Tries both candidate I2C
+// addresses (see DISPLAY_I2C_ADDR_CANDIDATES above) before giving up.
 static void initDisplay() {
     Wire.begin(I2C_SDA, I2C_SCL);
-    if (!display.begin(DISPLAY_I2C_ADDR, true)) {
-        haltWithError("Display init failed - check I2C wiring to SH1106");
+    for (uint8_t addr : DISPLAY_I2C_ADDR_CANDIDATES) {
+        if (display.begin(addr, true)) {
+            displayI2cAddr = addr;
+            displayAvailable = true;
+            display.clearDisplay();
+            display.display();
+            return;
+        }
     }
-    display.clearDisplay();
-    display.display();
+    Serial.println("Display init failed at 0x3C and 0x3D - continuing without it");
 }
 
 // Panel stays off between transmissions to save power -- it wakes for a
@@ -166,6 +190,9 @@ static constexpr uint32_t DISPLAY_HOLD_MS = 5000;
 bool displayOn = false;
 
 static void displayWake() {
+    if (!displayAvailable) {
+        return;
+    }
     if (!displayOn) {
         display.oled_command(SH110X_DISPLAYON);
         displayOn = true;
@@ -173,18 +200,25 @@ static void displayWake() {
 }
 
 // Re-runs the I2C bus + SH1106 controller init before each cycle's display
-// writes. Unlike initDisplay() at boot, a failure here doesn't halt the
-// device -- GPS/LoRa/SOS need to keep working even if the screen can't be
-// brought back, and halting over a flaky display would be a far worse
-// failure mode than just a blank one. This exists because the display's
-// rail is never gated (only ALDO3/ALDO4 are), but the ESP32's own I2C
-// peripheral state isn't guaranteed to survive esp_light_sleep_start()
+// writes, reusing whichever address initDisplay() found working at boot
+// (displayI2cAddr) rather than re-probing both every cycle. Unlike
+// initDisplay() at boot, a failure here doesn't disable anything further --
+// it was already non-fatal at boot too, so this just means the display
+// stays unavailable for this cycle, same as if it had never been found at
+// all. Skipped entirely if no display was ever found (displayAvailable),
+// since there's no known address to retry and no point probing hardware
+// that was already confirmed not to be there. This exists because the
+// display's rail is never gated (only ALDO3/ALDO4 are), but the ESP32's own
+// I2C peripheral state isn't guaranteed to survive esp_light_sleep_start()
 // unrestored -- plain displayWake() alone left the screen dead after the
 // first light sleep even though the controller itself was never powered
 // down.
 static void reinitDisplay() {
+    if (!displayAvailable) {
+        return;
+    }
     Wire.begin(I2C_SDA, I2C_SCL);
-    if (display.begin(DISPLAY_I2C_ADDR, true)) {
+    if (display.begin(displayI2cAddr, true)) {
         displayOn = true; // begin() unconditionally leaves the OLED powered on
     } else {
         Serial.println("  display re-init failed, continuing without it");
@@ -192,6 +226,9 @@ static void reinitDisplay() {
 }
 
 static void displaySleep() {
+    if (!displayAvailable) {
+        return;
+    }
     if (displayOn) {
         display.oled_command(SH110X_DISPLAYOFF);
         displayOn = false;
@@ -201,8 +238,12 @@ static void displaySleep() {
 // line2 is the big/important word ("Sending", "Delivered", "Send failed");
 // line1 is the small context above it (message type, or a boot message).
 // No ACK yet (see FW-06 in the backlog), so "Delivered" here means "the
-// radio call returned success," not "a human received this."
+// radio call returned success," not "a human received this." A no-op if no
+// display was ever found -- see displayAvailable.
 static void showStatus(const char *line1, const char *line2) {
+    if (!displayAvailable) {
+        return;
+    }
     display.clearDisplay();
     display.setTextColor(SH110X_WHITE);
 

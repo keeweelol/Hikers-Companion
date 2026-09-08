@@ -211,6 +211,18 @@ behind the ALDO3/ALDO4 rails, which are off at boot. `initPower()` in
 `main.cpp` turns them on — skip that step and the radio/GPS silently never
 power up even with correct wiring.
 
+LilyGO ships this board with two magnetometer sub-variants (QMC6310U vs
+QMC6310N) that put the SH1106 OLED at different I2C addresses — 0x3C or
+0x3D respectively. Confirmed on our own bench: our two units needed
+different addresses. `initDisplay()`/`runProvisioningMode()` both probe
+`0x3C` then `0x3D` rather than assuming one (`DISPLAY_I2C_ADDR_CANDIDATES`).
+Display failure is non-fatal everywhere, including at boot — `initDisplay()`
+used to `haltWithError()` if the display didn't respond, which took the
+*entire* device down (no GPS, no LoRa, no SOS) over what looked like just a
+dead screen. It now logs and continues with `displayAvailable = false`;
+every `display*` function in `main.cpp` checks that flag and no-ops rather
+than touching hardware that was never found.
+
 The board's PWR button isn't a GPIO at all — it's wired into the AXP2101 as
 its power key, reported by pulling `PMU_IRQ_PIN` low. `initPower()`
 disables every other AXP2101 IRQ source and enables only
