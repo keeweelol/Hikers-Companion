@@ -206,22 +206,40 @@ Wire format on the air: `[12-byte nonce][ciphertext][16-byte tag]`.
 
 ## Known gotcha
 
-The T-Beam Supreme's AXP2101 PMU gates power to the LoRa and GPS modules
-behind the ALDO3/ALDO4 rails, which are off at boot. `initPower()` in
-`main.cpp` turns them on — skip that step and the radio/GPS silently never
-power up even with correct wiring.
+The T-Beam Supreme's AXP2101 PMU gates power to the LoRa, GPS, and display
+modules behind the ALDO3, ALDO4, and ALDO1 rails respectively, all off at
+boot. `initPower()` in `main.cpp` turns them on — skip any of these and
+that module silently never powers up even with correct wiring. ALDO1 is
+the one that actually bit us: per LilyGO's own hardware doc it's shared
+across the display, the BME280 sensor, and the magnetometer, and our
+`initPower()` originally only ever enabled ALDO3/ALDO4, never ALDO1. One of
+our two units had a screen that stayed completely black through boot even
+though `display.begin()` reported success and the rest of the device ran
+fine — flashing Meshtastic on the same unit proved the OLED hardware itself
+was fine, which pointed straight at power rather than the display or its
+I2C address. The SH1106 controller could apparently still ACK basic I2C
+reads/writes with no ALDO1 power at all (enough for `begin()` to report
+success), but never had the power to actually drive the panel. `initPower()`
+now enables ALDO1 alongside ALDO3/ALDO4, and — because `runProvisioningMode()`
+can be entered via the boot-hold path *before* `initPower()` would otherwise
+run (it's `[[noreturn]]`, so the rest of `setup()` never executes in that
+boot) — `initPower()` was moved ahead of the `bootButtonHeldForProvisioning()`
+check in `setup()`, so both entry paths into provisioning always have a
+powered display too.
 
-LilyGO ships this board with two magnetometer sub-variants (QMC6310U vs
-QMC6310N) that put the SH1106 OLED at different I2C addresses — 0x3C or
-0x3D respectively. Confirmed on our own bench: our two units needed
-different addresses. `initDisplay()`/`runProvisioningMode()` both probe
-`0x3C` then `0x3D` rather than assuming one (`DISPLAY_I2C_ADDR_CANDIDATES`).
-Display failure is non-fatal everywhere, including at boot — `initDisplay()`
-used to `haltWithError()` if the display didn't respond, which took the
-*entire* device down (no GPS, no LoRa, no SOS) over what looked like just a
-dead screen. It now logs and continues with `displayAvailable = false`;
-every `display*` function in `main.cpp` checks that flag and no-ops rather
-than touching hardware that was never found.
+LilyGO also ships this board with two magnetometer sub-variants (QMC6310U
+vs QMC6310N) that, per their docs, put the SH1106 OLED at different I2C
+addresses — 0x3C or 0x3D respectively. We haven't actually confirmed this
+varies between our own two units (the ALDO1 gap above was the real bug on
+the unit we tested), but `initDisplay()`/`runProvisioningMode()` both probe
+`0x3C` then `0x3D` rather than assuming one anyway (`DISPLAY_I2C_ADDR_CANDIDATES`),
+since it's cheap insurance against a documented hardware variance for this
+exact board. Display failure is non-fatal everywhere, including at boot —
+`initDisplay()` used to `haltWithError()` if the display didn't respond,
+which took the *entire* device down (no GPS, no LoRa, no SOS) over what
+looked like just a dead screen. It now logs and continues with
+`displayAvailable = false`; every `display*` function in `main.cpp` checks
+that flag and no-ops rather than touching hardware that was never found.
 
 The board's PWR button isn't a GPIO at all — it's wired into the AXP2101 as
 its power key, reported by pulling `PMU_IRQ_PIN` low. `initPower()`

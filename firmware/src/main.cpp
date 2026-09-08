@@ -129,9 +129,19 @@ static void haltWithError(const char *message) {
     }
 }
 
-// The T-Beam Supreme gates LoRa and GPS power behind the AXP2101 PMU's ALDO3
-// and ALDO4 rails -- they are off by default at boot. Without this, the
-// radio and GPS modules never power up even though the wiring is correct.
+// The T-Beam Supreme gates LoRa, GPS, and the display behind the AXP2101
+// PMU's ALDO3, ALDO4, and ALDO1 rails respectively -- all off by default at
+// boot. Without this, the radio/GPS/display modules never power up even
+// though the wiring is correct. ALDO1 (per LilyGO's own hardware doc) is
+// actually shared across the display, the BME280 sensor, and the
+// magnetometer -- we only use it for the display here, but it can't be
+// scoped any more narrowly than that at the hardware level. Missing this
+// exact rail was the real cause of a "dead" display on one of our two
+// units: the SH1106 controller could still ACK basic I2C reads/writes with
+// no main power (enough to make display.begin() report success), but never
+// had the power to actually drive the panel -- so it looked like a bad
+// screen or a wrong I2C address, when the rail powering it was simply never
+// turned on.
 static void initPower() {
     PMUWire.begin(PMU_SDA, PMU_SCL);
 
@@ -145,6 +155,9 @@ static void initPower() {
 
     PMU->setPowerChannelVoltage(XPOWERS_ALDO4, 3300); // GPS rail
     PMU->enablePowerOutput(XPOWERS_ALDO4);
+
+    PMU->setPowerChannelVoltage(XPOWERS_ALDO1, 3300); // Display (+ BME280 + magnetometer) rail
+    PMU->enablePowerOutput(XPOWERS_ALDO1);
 
     // The board's physical PWR button isn't a GPIO at all -- it's wired
     // into the AXP2101 as its "power key," which reports presses by
@@ -547,16 +560,25 @@ void setup() {
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-    // Checked before anything else touches power rails or radios: holding
-    // BOOT through power-on is the only way into BLE provisioning (FW-10),
-    // so normal operation never has BLE running and doesn't touch the
-    // sleep/power budget FW-12 was built around. runProvisioningMode()
-    // itself never returns -- it esp_restart()s when done.
+    // initPower() has to run before the boot-hold check, not after: it's
+    // what enables ALDO1, the rail the display (along with the BME280 and
+    // magnetometer) sits behind. runProvisioningMode() is [[noreturn]], so
+    // if the check below fires, initGPS()/initRadio() on the next lines
+    // never run at all in that boot -- only initPower() needs to happen
+    // first, since provisioning mode does its own display init but has no
+    // GPS/LoRa use for the rest of this sequence.
+    initPower();
+
+    // Holding BOOT through power-on is the only way into BLE provisioning
+    // (FW-10) from a cold boot -- see also checkBluetoothButton() for the
+    // separate on-the-fly PWR-button path during normal operation. Normal
+    // operation never has BLE running, so it doesn't touch the sleep/power
+    // budget FW-12 was built around. runProvisioningMode() itself never
+    // returns -- it esp_restart()s when done.
     if (bootButtonHeldForProvisioning()) {
         runProvisioningMode();
     }
 
-    initPower();
     initGPS();
     initRadio();
     initDisplay();
