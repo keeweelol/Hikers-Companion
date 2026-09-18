@@ -162,12 +162,14 @@ static void initPower() {
     // The board's physical PWR button isn't a GPIO at all -- it's wired
     // into the AXP2101 as its "power key," which reports presses by
     // pulling PMU_IRQ_PIN low. Disabling every other IRQ source means that
-    // pin can only go low for one reason, so bluetoothButtonPressed() can
-    // treat "pin is low" as "PWR was short-pressed" without decoding the
-    // status register further.
+    // pin can only go low for a PWR press, and bluetoothButtonPressed()
+    // decodes short vs long from the status register. A long press also
+    // starts a hardware countdown: the PMU cuts every rail, ESP32 included,
+    // at XPOWERS_POWEROFF_4S regardless of what firmware does.
     PMU->disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
     PMU->clearIrqStatus();
-    PMU->enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ);
+    PMU->enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ | XPOWERS_AXP2101_PKEY_LONG_IRQ);
+    PMU->setPowerKeyPressOffTime(XPOWERS_POWEROFF_4S);
     pinMode(PMU_IRQ_PIN, INPUT_PULLUP);
 }
 
@@ -374,19 +376,34 @@ static void handleButtonPress() {
     Serial.println(sosActive ? "SOS button pressed - beacon started" : "SOS button pressed - beacon canceled");
 }
 
-// PMU_IRQ_PIN only ever goes low for a PWR short-press -- see initPower(),
-// which disables every other AXP2101 IRQ source -- so this is a plain level
-// read, no debounce needed the way BUTTON_PIN needs one: the AXP2101 has
-// already qualified the press itself before raising the IRQ. clearIrqStatus()
+// PMU_IRQ_PIN only ever goes low for a PWR press -- see initPower(), which
+// disables every other AXP2101 IRQ source -- so this is a plain level read,
+// no debounce needed the way BUTTON_PIN needs one: the AXP2101 has already
+// qualified the press itself before raising the IRQ. clearIrqStatus()
 // releases the line back high; skipping it would leave PMU_IRQ_PIN stuck low
 // and this function permanently "pressed."
+//
+// A long press is handled here rather than returned: the hardware countdown
+// to power-off can't be aborted once started, so this just shows "Power Off"
+// for the time left and parks (the infinite loop mirrors haltWithError()).
+// It applies even while SOS is active, since the PMU cuts power regardless.
 static bool bluetoothButtonPressed() {
     if (digitalRead(PMU_IRQ_PIN) != LOW) {
         return false;
     }
     PMU->getIrqStatus();
     bool shortPress = PMU->isPekeyShortPressIrq();
+    bool longPress = PMU->isPekeyLongPressIrq();
     PMU->clearIrqStatus();
+
+    if (longPress) {
+        Serial.println("PWR long-press - shutting down");
+        reinitDisplay();
+        showStatus("Power", "Off");
+        while (true) {
+            delay(100);
+        }
+    }
     return shortPress;
 }
 
