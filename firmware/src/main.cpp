@@ -331,6 +331,21 @@ static void radioRailUp() {
 // state (unlike deep sleep), so there's nothing else here that needs
 // saving/restoring around it.
 static void lightSleepMs(uint32_t durationMs) {
+#ifdef DEBUG_NO_SLEEP
+    // Bench-debug build (env t-beam-supreme-debug): light sleep suspends native
+    // USB CDC, so serial output goes dead between cycles. Stay awake instead and
+    // poll the same two wake sources, so a monitor sees every cycle live.
+    // Rails are still gated -- only the CPU sleep is skipped, so this draws
+    // more power than the real build and is not for power measurement.
+    uint32_t start = millis();
+    while (millis() - start < durationMs) {
+        if (digitalRead(BUTTON_PIN) == LOW || digitalRead(PMU_IRQ_PIN) == LOW) {
+            return;
+        }
+        delay(10);
+    }
+    return;
+#endif
     esp_sleep_enable_timer_wakeup((uint64_t)durationMs * 1000ULL);
 
     gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
