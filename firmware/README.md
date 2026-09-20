@@ -32,7 +32,9 @@ An SH1106 OLED (I2C, pins 17/18) shows live status via `showStatus()`:
 message type on top, "Sending" / "Delivered" / "No ACK" / "Send failed"
 below. "Delivered" is now a real ACK, not an assumption: each packet carries
 a small message id (`<type>,<id>,<location>`), and after transmitting, the
-T-Beam listens for up to `ACK_TIMEOUT_MS` (2s) for a matching `ACK,<id>`
+T-Beam listens for a matching `ACK,<id>` for up to the ACK's own airtime at
+the current spreading factor plus `ACK_TURNAROUND_MARGIN_MS` (computed in
+`waitForAck()`, so the window grows automatically from SF7 to SF12)
 reply from the Heltec RX rig (`waitForAck()`/`sendAck()`). A timeout with no
 reply shows "No ACK" — distinct from "Send failed," which means the radio
 call itself errored, not that nobody answered.

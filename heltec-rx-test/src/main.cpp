@@ -40,8 +40,11 @@ static constexpr uint8_t OLED_I2C_ADDR = 0x3C;
 // Must match LORA_* constants in firmware/src/main.cpp.
 static constexpr float LORA_FREQUENCY_MHZ = 915.0;
 static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
-static constexpr uint8_t LORA_SPREADING_FACTOR = 7;
+static constexpr uint8_t LORA_SPREADING_FACTOR = 12;
 static constexpr uint8_t LORA_CODING_RATE = 5;
+// Sets the power ACKs go out at. Left unset this is RadioLib's default of
+// 10 dBm, well below the T-Beam's, so the ACK leg dropped out first at range.
+static constexpr int8_t LORA_TX_POWER_DBM = 22;
 
 SX1262 radio = new Module(LORA_CS_PIN, LORA_DIO1_PIN, LORA_RST_PIN, LORA_BUSY_PIN);
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RST_PIN);
@@ -235,6 +238,7 @@ void setup() {
     radio.setBandwidth(LORA_BANDWIDTH_KHZ);
     radio.setSpreadingFactor(LORA_SPREADING_FACTOR);
     radio.setCodingRate(LORA_CODING_RATE);
+    radio.setOutputPower(LORA_TX_POWER_DBM);
 
     radio.setDio1Action(onPacketReceived);
 

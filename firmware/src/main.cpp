@@ -29,19 +29,26 @@
 // range over throughput; revisit once we have real range-test data.
 static constexpr float LORA_FREQUENCY_MHZ = 915.0;
 static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
-static constexpr uint8_t LORA_SPREADING_FACTOR = 7;
+static constexpr uint8_t LORA_SPREADING_FACTOR = 12;
 static constexpr uint8_t LORA_CODING_RATE = 5;
-static constexpr int8_t LORA_TX_POWER_DBM = 17;
+static constexpr int8_t LORA_TX_POWER_DBM = 22; // SX1262 max; more range, more current per send
 
 // Report's flow chart calls for polling roughly once a minute; kept as a
 // constant here so it's easy to tune once battery-life testing informs it.
 static constexpr uint32_t SEND_INTERVAL_MS = 60000;
 
-// How long to listen for an ACK after transmitting before giving up. This
-// blocks loop() (GPS/button polling included) for up to this long right
-// after a send -- acceptable since it only happens once per send, not
-// continuously.
-static constexpr uint32_t ACK_TIMEOUT_MS = 2000;
+// The ACK listen window is computed per send in waitForAck() from the ACK's
+// real airtime at the configured spreading factor (radio.getTimeOnAir()),
+// plus this margin for the receiver to finish decrypting, printing, and
+// switching to transmit. A fixed window (the old 2s) works at SF7-SF10 but
+// is shorter than the ACK's own airtime at SF11/SF12, so it reported "no ACK"
+// on a perfectly good link. This blocks loop() (GPS/button polling included)
+// for up to that long right after a send -- acceptable since it only happens
+// once per send, not continuously.
+static constexpr uint32_t ACK_TURNAROUND_MARGIN_MS = 750;
+
+// Longest ACK plaintext is "ACK,65535" (message ids are uint16_t).
+static constexpr size_t kMaxAckPlainLen = 9;
 
 // GPIO0 has no external debounce hardware on this board -- a plain
 // digitalRead() chatters across several transitions on every press/release.
@@ -448,15 +455,23 @@ static String buildLocationMessage() {
     return message;
 }
 
-// Listens for up to ACK_TIMEOUT_MS for a reply matching "ACK,<expectedId>".
-// radio.receive() blocks (with the given timeout) and internally calls
-// readData() for us, so no separate startReceive()/interrupt dance is
-// needed here -- that pattern is only for continuous listening.
+// Listens for a reply matching "ACK,<expectedId>", for as long as the
+// longest possible ACK takes to arrive at the current spreading factor plus
+// ACK_TURNAROUND_MARGIN_MS. radio.receive() blocks (with the given timeout)
+// and internally calls readData() for us, so no separate
+// startReceive()/interrupt dance is needed here -- that pattern is only for
+// continuous listening.
 static bool waitForAck(uint16_t expectedId) {
     static constexpr size_t kMaxAckCipherLen = 64;
     uint8_t ackCipherBuf[kMaxAckCipherLen];
 
-    int state = radio.receive(ackCipherBuf, kMaxAckCipherLen, ACK_TIMEOUT_MS);
+    size_t maxAckOnAirBytes = kMaxAckPlainLen + HC_GCM_NONCE_LEN + HC_GCM_TAG_LEN;
+    uint32_t ackAirtimeMs = (uint32_t)(radio.getTimeOnAir(maxAckOnAirBytes) / 1000);
+    uint32_t ackTimeoutMs = ackAirtimeMs + ACK_TURNAROUND_MARGIN_MS;
+    Serial.printf("  ACK window %u ms (ACK airtime %u ms + %u ms margin)\n",
+                  (unsigned)ackTimeoutMs, (unsigned)ackAirtimeMs, (unsigned)ACK_TURNAROUND_MARGIN_MS);
+
+    int state = radio.receive(ackCipherBuf, kMaxAckCipherLen, ackTimeoutMs);
     if (state != RADIOLIB_ERR_NONE) {
         Serial.println("  no ACK received");
         return false;
