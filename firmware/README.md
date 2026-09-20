@@ -113,11 +113,11 @@ bench activity rather than something to optimize for battery life.
 One command per line on the RX characteristic, one text reply per line back
 over TX (`sendLine()`/`RxCallbacks::onWrite()` in `src/ble_provisioning.cpp`):
 
-- `<slot 0-2>|<name>|<phone>` — store one of up to 3 emergency contacts.
+- `<slot 0-1>|<name>|<phone>` — store one of up to 2 emergency contacts.
   Replies `OK: stored slot <n>`.
-- `LIST` — replies with all 3 slots as `<slot>:<name>:<phone>` lines,
+- `LIST` — replies with all slots as `<slot>:<name>:<phone>` lines,
   confirming what's actually stored.
-- `CLEAR` — wipes all 3 slots.
+- `CLEAR` — wipes all slots.
 - `DONE` — ends the session immediately instead of waiting on a disconnect.
 - Anything else gets an `ERR: ...` reply rather than being silently dropped,
   since a human is typing these by hand.

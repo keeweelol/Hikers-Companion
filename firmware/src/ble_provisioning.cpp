@@ -19,7 +19,14 @@ constexpr uint32_t PROVISION_HOLD_MS = 2000;
 // accident on power-up.
 constexpr uint32_t PROVISION_IDLE_TIMEOUT_MS = 180000;
 
-constexpr uint8_t MAX_CONTACTS = 3;
+constexpr uint8_t MAX_CONTACTS = 2;
+
+// Every user-facing mention of the valid slot range is built from
+// MAX_CONTACTS rather than spelled out, so changing the count above can't
+// leave a stale "0-2" in a prompt or error message.
+String slotRange() {
+    return "0-" + String(MAX_CONTACTS - 1);
+}
 
 // Nordic UART Service (NUS) UUIDs -- a de facto standard that terminal-style
 // BLE apps (Serial Bluetooth Terminal, nRF Toolbox/Connect's UART preset,
@@ -111,9 +118,9 @@ void sendLine(const String &line) {
 
 // Command protocol over RX, one command per write (matches how terminal
 // apps send a line at a time):
-//   <slot 0-2>|<name>|<phone>   store a contact
-//   LIST                        reply with all 3 slots
-//   CLEAR                       wipe all 3 slots
+//   <slot 0-1>|<name>|<phone>   store a contact
+//   LIST                        reply with all slots
+//   CLEAR                       wipe all slots
 //   DONE                        end the provisioning session
 // Anything else gets an ERR reply on TX rather than being silently dropped,
 // since a human is typing these by hand.
@@ -151,13 +158,13 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
         int firstBar = value.indexOf('|');
         int secondBar = firstBar < 0 ? -1 : value.indexOf('|', firstBar + 1);
         if (firstBar < 0 || secondBar < 0) {
-            sendLine("ERR: expected <slot 0-2>|<name>|<phone>, LIST, CLEAR, or DONE");
+            sendLine("ERR: expected <slot " + slotRange() + ">|<name>|<phone>, LIST, CLEAR, or DONE");
             return;
         }
 
         int slot = value.substring(0, firstBar).toInt();
         if (slot < 0 || slot >= MAX_CONTACTS) {
-            sendLine("ERR: slot must be 0-" + String(MAX_CONTACTS - 1));
+            sendLine("ERR: slot must be " + slotRange());
             return;
         }
 
@@ -203,7 +210,7 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
         if (subValue == 0) {
             return; // client unsubscribed, nothing to greet
         }
-        sendLine("Hiker's Companion provisioning. Commands: <slot 0-2>|<name>|<phone>, LIST, CLEAR, DONE");
+        sendLine("Hiker's Companion provisioning. Commands: <slot " + slotRange() + ">|<name>|<phone>, LIST, CLEAR, DONE");
     }
 };
 
@@ -281,7 +288,7 @@ void runProvisioningMode() {
     advertising->start();
 
     Serial.printf("  advertising as %s (Nordic UART Service)\n", deviceName);
-    Serial.println("  commands: \"<slot 0-2>|<name>|<phone>\", \"LIST\", \"CLEAR\", \"DONE\"");
+    Serial.printf("  commands: \"<slot %s>|<name>|<phone>\", \"LIST\", \"CLEAR\", \"DONE\"\n", slotRange().c_str());
 
     // The connect/disconnect events themselves fire from NimBLE's own host
     // task, not this loop -- polling clientConnected here and drawing from
