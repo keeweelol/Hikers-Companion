@@ -266,10 +266,10 @@ void loop() {
     scheduleDisplayOff(DISPLAY_HOLD_MS);
 
     // Must stay >= the T-Beam's kMaxPlaintextLen (160) + HC_GCM_NONCE_LEN +
-    // HC_GCM_TAG_LEN (188 total) -- the first SOS transmission after
-    // activation rides a stored-contacts field alongside the location (see
-    // sosContactsPending in firmware/src/main.cpp), which needs more room
-    // than the plain location-only packets this was originally sized for.
+    // HC_GCM_TAG_LEN (188 total) -- every SOS transmission rides a
+    // stored-contacts field alongside the location (see sendLocationPacket()
+    // in firmware/src/main.cpp), which needs more room than the plain
+    // location-only packets this was originally sized for.
     static constexpr size_t kMaxCipherLen = 192;
     size_t cipherLen = radio.getPacketLength();
 

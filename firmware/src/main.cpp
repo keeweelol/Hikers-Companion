@@ -106,14 +106,6 @@ uint32_t lastButtonChangeMs = 0;
 // back to routine sends. A second press cancels it.
 bool sosActive = false;
 
-// Set the moment SOS activates, consumed by the very next SOS send (see
-// sendLocationPacket()), then cleared -- so the emergency contact list rides
-// along on just that first packet, not every repeat of the standing beacon.
-// Left alone (not cleared) by a routine "OK" send, so if SOS gets canceled
-// before it ever actually transmits, the contacts are still attached to
-// whichever SOS send eventually happens next.
-bool sosContactsPending = false;
-
 static void printHex(const char *label, const uint8_t *data, size_t len) {
     Serial.print(label);
     for (size_t i = 0; i < len; i++) {
@@ -385,9 +377,6 @@ static bool buttonPressed() {
 
 static void handleButtonPress() {
     sosActive = !sosActive;
-    if (sosActive) {
-        sosContactsPending = true; // only the next SOS send carries the stored contacts
-    }
     Serial.println(sosActive ? "SOS button pressed - beacon started" : "SOS button pressed - beacon canceled");
 }
 
@@ -500,13 +489,12 @@ static bool waitForAck(uint16_t expectedId) {
 // where type is "OK" for a routine poll or "SOS" for a button-triggered
 // emergency send, and id lets waitForAck() match a reply to this specific
 // send. The trailing <contacts> field (see buildContactsForSos() in
-// ble_provisioning.cpp) is appended only once -- on the first send after SOS
-// activates (sosContactsPending) -- not on every repeat of a standing SOS
-// beacon, so responders learn who to notify without re-sending that data on
-// every ~60s heartbeat. If it wouldn't fit alongside the location, it's
-// dropped and the location-only packet still goes out: the location itself
-// must never fail to send just because someone's stored contact names ran
-// long.
+// ble_provisioning.cpp) rides along on every SOS send, so a responder who
+// only catches one packet of a standing beacon still learns who to notify --
+// no single packet is the one that has to get through. If it wouldn't fit
+// alongside the location, it's dropped and the location-only packet still
+// goes out: the location itself must never fail to send just because
+// someone's stored contact names ran long.
 static void sendLocationPacket(const char *type) {
     reinitDisplay();
     showStatus(type, "Sending...");
@@ -516,14 +504,13 @@ static void sendLocationPacket(const char *type) {
 
     static constexpr size_t kMaxPlaintextLen = 160;
 
-    if (sosActive && sosContactsPending) {
+    if (sosActive) {
         String withContacts = payload + "," + buildContactsForSos();
         if (withContacts.length() <= kMaxPlaintextLen) {
             payload = withContacts;
         } else {
             Serial.println("  contacts too long to fit with location, sending location only");
         }
-        sosContactsPending = false;
     }
 
     Serial.print("TX (plaintext): ");

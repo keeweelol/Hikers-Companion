@@ -24,9 +24,8 @@ bool bootButtonHeldForProvisioning();
 [[noreturn]] void runProvisioningMode();
 
 // Compact "name:phone;name:phone;..." summary of the stored emergency
-// contacts, empty slots skipped, for embedding in an SOS packet's first
-// transmission (see sosContactsPending in main.cpp). Opens, reads, and
-// closes NVS itself in one call, so it's safe to call from normal
-// operation with no provisioning session active. Empty string if no
-// contacts have ever been stored.
+// contacts, empty slots skipped, for embedding in every SOS packet (see
+// sendLocationPacket() in main.cpp). Opens, reads, and closes NVS itself in
+// one call, so it's safe to call from normal operation with no provisioning
+// session active. Empty string if no contacts have ever been stored.
 String buildContactsForSos();

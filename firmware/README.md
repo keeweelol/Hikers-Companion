@@ -139,19 +139,16 @@ before this leaves the bench.
 
 ### Contacts over LoRa
 
-The stored contacts do go out over LoRa now, but only once per SOS
-activation, not on every repeat. Pressing SOS sets `sosContactsPending`
-(`main.cpp`); the very next `sendLocationPacket()` call appends
+The stored contacts go out over LoRa on **every** SOS send, not just the
+first one. While `sosActive` is set, `sendLocationPacket()` appends
 `,<buildContactsForSos()>` — a compact `name:phone;name:phone;...` summary,
-empty slots skipped — to that one packet and clears the flag, so every
-later repeat of a standing SOS beacon goes back to being location-only.
-Canceling SOS before it ever actually transmits leaves the flag set rather
-than clearing it, so contacts still ride along on whichever SOS send
-eventually happens next.
+empty slots skipped — to each packet of the standing beacon.
 
-This is a deliberate one-shot, not a bug: sending the full contact list on
-every ~60s beacon repeat would waste airtime on data that essentially never
-changes mid-emergency, when responders only need to learn it once. If the
+Repeating the list on every beacon costs airtime on data that doesn't change
+mid-emergency, but that redundancy is the point: LoRa packets get lost, and a
+responder who only catches one packet out of a standing beacon still learns
+who to notify. With a one-shot, losing that single packet meant losing the
+contacts for the entire emergency. If the
 combined location+contacts string would overflow the crypto buffer
 (`kMaxPlaintextLen`, now 160 bytes — raised from the location-only packet's
 64 specifically to fit this), the contacts are dropped for that send and
