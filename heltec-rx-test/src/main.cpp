@@ -40,7 +40,7 @@ static constexpr uint8_t OLED_I2C_ADDR = 0x3C;
 // Must match LORA_* constants in firmware/src/main.cpp.
 static constexpr float LORA_FREQUENCY_MHZ = 915.0;
 static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
-static constexpr uint8_t LORA_SPREADING_FACTOR = 10;
+static constexpr uint8_t LORA_SPREADING_FACTOR = 7;
 static constexpr uint8_t LORA_CODING_RATE = 5;
 
 SX1262 radio = new Module(LORA_CS_PIN, LORA_DIO1_PIN, LORA_RST_PIN, LORA_BUSY_PIN);

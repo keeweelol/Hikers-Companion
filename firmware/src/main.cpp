@@ -29,7 +29,7 @@
 // range over throughput; revisit once we have real range-test data.
 static constexpr float LORA_FREQUENCY_MHZ = 915.0;
 static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
-static constexpr uint8_t LORA_SPREADING_FACTOR = 10;
+static constexpr uint8_t LORA_SPREADING_FACTOR = 7;
 static constexpr uint8_t LORA_CODING_RATE = 5;
 static constexpr int8_t LORA_TX_POWER_DBM = 17;
 
