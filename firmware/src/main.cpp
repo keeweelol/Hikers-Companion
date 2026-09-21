@@ -1,11 +1,6 @@
-// Hiker's Companion firmware
-//
-// Reads GPS location and transmits it over LoRa on a fixed interval, with an
-// SOS button, OLED status display, and delivery ACK. Between sends the
-// GPS/LoRa PMU rails are gated off and the ESP32 light-sleeps (see loop()) —
-// that duty cycle is what the report's average current draw is based on.
-//
-// Target: LILYGO T-Beam Supreme (ESP32-S3, SX1262, AXP2101, GNSS)
+// Hiker's Companion firmware for the LILYGO T-Beam Supreme (ESP32-S3, SX1262, AXP2101, GNSS).
+// Sends GPS location over LoRa on an interval, with SOS button, OLED status, and delivery ACK.
+// Between sends the GPS/LoRa rails are cut and the ESP32 light-sleeps (see loop()).
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
@@ -22,57 +17,34 @@
 #include "hc_crypto.h"
 #include "pins.h"
 
-// ---- Radio configuration -------------------------------------------------
-// 915 MHz sits in the US902-928 MHz ISM band the report identifies as our
-// target. Spreading factor is not finalized in the report (SF7-SF12
-// range/rate tradeoff) -- SF10 is a reasonable starting point that favors
-// range over throughput; revisit once we have real range-test data.
+// ---- Radio configuration ----
+// US902-928 MHz ISM band. SF must match the Heltec receiver.
 static constexpr float LORA_FREQUENCY_MHZ = 915.0;
 static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
-static constexpr uint8_t LORA_SPREADING_FACTOR = 12;
+static constexpr uint8_t LORA_SPREADING_FACTOR = 7;
 static constexpr uint8_t LORA_CODING_RATE = 5;
-static constexpr int8_t LORA_TX_POWER_DBM = 22; // SX1262 max; more range, more current per send
+static constexpr int8_t LORA_TX_POWER_DBM = 22; // SX1262 max
 
-// Report's flow chart calls for polling roughly once a minute; kept as a
-// constant here so it's easy to tune once battery-life testing informs it.
 static constexpr uint32_t SEND_INTERVAL_MS = 60000;
 
-// The ACK listen window is computed per send in waitForAck() from the ACK's
-// real airtime at the configured spreading factor (radio.getTimeOnAir()),
-// plus this margin for the receiver to finish decrypting, printing, and
-// switching to transmit. A fixed window (the old 2s) works at SF7-SF10 but
-// is shorter than the ACK's own airtime at SF11/SF12, so it reported "no ACK"
-// on a perfectly good link. This blocks loop() (GPS/button polling included)
-// for up to that long right after a send -- acceptable since it only happens
-// once per send, not continuously.
+// ACK listen window = ACK airtime at the current SF (computed in waitForAck())
+// plus this margin for the receiver's decrypt/print/turnaround.
 static constexpr uint32_t ACK_TURNAROUND_MARGIN_MS = 750;
 
 // Longest ACK plaintext is "ACK,65535" (message ids are uint16_t).
 static constexpr size_t kMaxAckPlainLen = 9;
 
-// GPIO0 has no external debounce hardware on this board -- a plain
-// digitalRead() chatters across several transitions on every press/release.
+// GPIO0 has no hardware debounce.
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
 
-// GPS and the LoRa radio are only powered for the acquire+send window each
-// cycle (see gpsRailUp()/radioRailUp() and the light sleep in loop()) --
-// unlike milestone 1's always-on loop, this is a cold GPS acquisition every
-// cycle, not a running fix. 25s is a placeholder budget pending real TTFF
-// measurements on this module, same caveat as the other timing constants.
+// GPS is cold-started every cycle; 25s is a placeholder pending real TTFF data.
 static constexpr uint32_t GPS_ACQUIRE_BUDGET_MS = 25000;
 
-// An SOS press gets a much shorter acquisition window than a routine poll --
-// getting the packet on the air fast matters more than a precise fix, and a
-// hiker who just hit the button shouldn't wait out the full budget above.
-// buildLocationMessage() still reports whatever fix (possibly stale, or
-// none) TinyGPSPlus has on hand either way.
+// SOS gets a short window: getting the packet out beats a precise fix.
 static constexpr uint32_t GPS_ACQUIRE_QUICK_MS = 2000;
 
-// ---- Globals ---------------------------------------------------------
-// XPowersAXP2101's power-control methods are only public through the
-// XPowersLibInterface base -- the concrete class re-declares them protected,
-// so the pointer must be typed as the interface (this matches XPowersLib's
-// own usage pattern, not a workaround).
+// ---- Globals ----
+// Must be typed as the interface: the concrete class makes power control protected.
 TwoWire PMUWire = TwoWire(1);
 XPowersLibInterface *PMU = nullptr;
 
@@ -84,33 +56,22 @@ SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUS
 static constexpr uint8_t DISPLAY_WIDTH = 128;
 static constexpr uint8_t DISPLAY_HEIGHT = 64;
 
-// LilyGO ships this exact board with two magnetometer sub-variants
-// (QMC6310U vs QMC6310N) that put the SH1106 OLED at different I2C
-// addresses -- 0x3C or 0x3D respectively (see the T-Beam Supreme hardware
-// doc). Two physical units on the bench can genuinely need different
-// addresses here; initDisplay() probes both rather than assuming one.
+// Two board sub-variants put the OLED at 0x3C or 0x3D, so initDisplay() probes both.
 static constexpr uint8_t DISPLAY_I2C_ADDR_CANDIDATES[] = {0x3C, 0x3D};
 Adafruit_SH1106G display(DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, -1);
 
-// Set once initDisplay() finds a display that actually responds, at
-// whichever of the two candidate addresses worked -- reinitDisplay() then
-// reuses this instead of re-probing both every cycle. False for the whole
-// run if neither address ever responded (no display present or a genuinely
-// dead one), in which case every display* function below becomes a no-op
-// rather than touching hardware that isn't there.
+// If no display ever responds, every display function is a no-op.
 bool displayAvailable = false;
 uint8_t displayI2cAddr = DISPLAY_I2C_ADDR_CANDIDATES[0];
 
 uint16_t nextMessageId = 0;
 
-// BUTTON_PIN uses INPUT_PULLUP, so idle-high/pressed-low.
+// BUTTON_PIN is INPUT_PULLUP: idle-high, pressed-low.
 bool lastButtonReading = HIGH;
 bool buttonState = HIGH;
 uint32_t lastButtonChangeMs = 0;
 
-// A press starts a standing SOS beacon (every periodic send goes out flagged
-// "SOS" instead of "OK") rather than sending just one SOS packet and falling
-// back to routine sends. A second press cancels it.
+// A press starts a standing SOS beacon (every send flagged "SOS"); a second press cancels it.
 bool sosActive = false;
 
 static void printHex(const char *label, const uint8_t *data, size_t len) {
@@ -128,19 +89,9 @@ static void haltWithError(const char *message) {
     }
 }
 
-// The T-Beam Supreme gates LoRa, GPS, and the display behind the AXP2101
-// PMU's ALDO3, ALDO4, and ALDO1 rails respectively -- all off by default at
-// boot. Without this, the radio/GPS/display modules never power up even
-// though the wiring is correct. ALDO1 (per LilyGO's own hardware doc) is
-// actually shared across the display, the BME280 sensor, and the
-// magnetometer -- we only use it for the display here, but it can't be
-// scoped any more narrowly than that at the hardware level. Missing this
-// exact rail was the real cause of a "dead" display on one of our two
-// units: the SH1106 controller could still ACK basic I2C reads/writes with
-// no main power (enough to make display.begin() report success), but never
-// had the power to actually drive the panel -- so it looked like a bad
-// screen or a wrong I2C address, when the rail powering it was simply never
-// turned on.
+// LoRa, GPS, and the display sit behind AXP2101 rails ALDO3/ALDO4/ALDO1, all off at boot.
+// Missing ALDO1 was the cause of a "dead" display: the controller still ACKs I2C
+// unpowered, so display.begin() succeeded but nothing lit up.
 static void initPower() {
     PMUWire.begin(PMU_SDA, PMU_SCL);
 
@@ -158,13 +109,9 @@ static void initPower() {
     PMU->setPowerChannelVoltage(XPOWERS_ALDO1, 3300); // Display (+ BME280 + magnetometer) rail
     PMU->enablePowerOutput(XPOWERS_ALDO1);
 
-    // The board's physical PWR button isn't a GPIO at all -- it's wired
-    // into the AXP2101 as its "power key," which reports presses by
-    // pulling PMU_IRQ_PIN low. Disabling every other IRQ source means that
-    // pin can only go low for a PWR press, and bluetoothButtonPressed()
-    // decodes short vs long from the status register. A long press also
-    // starts a hardware countdown: the PMU cuts every rail, ESP32 included,
-    // at XPOWERS_POWEROFF_4S regardless of what firmware does.
+    // The PWR button is the AXP2101 power key, reported by PMU_IRQ_PIN going low.
+    // Only its IRQs are enabled. A long press starts a hardware power-off
+    // countdown (4s) that firmware can't abort.
     PMU->disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
     PMU->clearIrqStatus();
     PMU->enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ | XPOWERS_AXP2101_PKEY_LONG_IRQ);
@@ -178,10 +125,7 @@ static void initGPS() {
     SerialGPS.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 }
 
-// Non-fatal on failure, unlike initPower()/initRadio() -- GPS/LoRa/SOS must
-// keep working even with a dead or undetectable display, since this is a
-// safety device first and a status screen second. Tries both candidate I2C
-// addresses (see DISPLAY_I2C_ADDR_CANDIDATES above) before giving up.
+// Non-fatal: GPS/LoRa/SOS must keep working with a dead display.
 static void initDisplay() {
     Wire.begin(I2C_SDA, I2C_SCL);
     for (uint8_t addr : DISPLAY_I2C_ADDR_CANDIDATES) {
@@ -196,10 +140,7 @@ static void initDisplay() {
     Serial.println("Display init failed at 0x3C and 0x3D - continuing without it");
 }
 
-// Panel stays off between transmissions to save power -- it wakes for a
-// send and holds through the result via holdDisplayThenSleep() below, which
-// light-sleeps for the hold instead of delay()ing so it isn't a needless
-// full-power stretch either.
+// The panel stays off between sends; it wakes for a send and holds through the result.
 static constexpr uint32_t DISPLAY_HOLD_MS = 5000;
 bool displayOn = false;
 
@@ -213,27 +154,15 @@ static void displayWake() {
     }
 }
 
-// Re-runs the I2C bus + SH1106 controller init before each cycle's display
-// writes, reusing whichever address initDisplay() found working at boot
-// (displayI2cAddr) rather than re-probing both every cycle. Unlike
-// initDisplay() at boot, a failure here doesn't disable anything further --
-// it was already non-fatal at boot too, so this just means the display
-// stays unavailable for this cycle, same as if it had never been found at
-// all. Skipped entirely if no display was ever found (displayAvailable),
-// since there's no known address to retry and no point probing hardware
-// that was already confirmed not to be there. This exists because the
-// display's rail is never gated (only ALDO3/ALDO4 are), but the ESP32's own
-// I2C peripheral state isn't guaranteed to survive esp_light_sleep_start()
-// unrestored -- plain displayWake() alone left the screen dead after the
-// first light sleep even though the controller itself was never powered
-// down.
+// The ESP32's I2C state doesn't reliably survive light sleep, so the bus and
+// controller are re-initialized before each cycle's draw. Non-fatal on failure.
 static void reinitDisplay() {
     if (!displayAvailable) {
         return;
     }
     Wire.begin(I2C_SDA, I2C_SCL);
     if (display.begin(displayI2cAddr, true)) {
-        displayOn = true; // begin() unconditionally leaves the OLED powered on
+        displayOn = true; // begin() leaves the OLED on
     } else {
         Serial.println("  display re-init failed, continuing without it");
     }
@@ -249,11 +178,7 @@ static void displaySleep() {
     }
 }
 
-// line2 is the big/important word ("Sending", "Delivered", "Send failed");
-// line1 is the small context above it (message type, or a boot message).
-// No ACK yet (see FW-06 in the backlog), so "Delivered" here means "the
-// radio call returned success," not "a human received this." A no-op if no
-// display was ever found -- see displayAvailable.
+// line1 is small context (message type); line2 is the big status word.
 static void showStatus(const char *line1, const char *line2) {
     if (!displayAvailable) {
         return;
@@ -288,12 +213,9 @@ static void initRadio() {
     radio.setOutputPower(LORA_TX_POWER_DBM);
 }
 
-// LoRa rail (ALDO3) and GPS rail (ALDO4) are the same PMU outputs initPower()
-// turns on at boot -- cut them here whenever GPS/radio have nothing to do
-// (the light sleep in loop()) instead of leaving both powered for the full
-// ~60s interval the way milestone 1 did.
+// The GPS and LoRa rails are cut whenever they have nothing to do.
 static void gpsRailDown() {
-    digitalWrite(GPS_EN_PIN, LOW); // avoid driving EN into an otherwise-unpowered GPS chip
+    digitalWrite(GPS_EN_PIN, LOW); // don't drive EN into an unpowered chip
     PMU->disablePowerOutput(XPOWERS_ALDO4);
 }
 
@@ -301,14 +223,8 @@ static void radioRailDown() {
     PMU->disablePowerOutput(XPOWERS_ALDO3);
 }
 
-// The SX1262 and the GPS module both lose all internal state when their
-// rail is cut, so bringing a rail back up means a full re-init, not just
-// flipping the PMU output back on -- reuses the same init*() setup() calls.
-// The delay() after each enablePowerOutput() is a conservative placeholder
-// for AXP2101 rail ramp-up before touching the chip on it over SPI/I2C --
-// initPower() gets this for free at boot from the setup steps that run
-// after it, but here initGPS()/initRadio() would otherwise run immediately
-// on a rail that was just re-enabled. Not measured against real hardware.
+// Both chips lose all state when their rail is cut, so bringing a rail up means a
+// full re-init. The 10ms delay is an unmeasured placeholder for rail ramp-up.
 static void gpsRailUp() {
     PMU->setPowerChannelVoltage(XPOWERS_ALDO4, 3300);
     PMU->enablePowerOutput(XPOWERS_ALDO4);
@@ -323,19 +239,11 @@ static void radioRailUp() {
     initRadio();
 }
 
-// Light-sleeps the ESP32 for durationMs, or until BUTTON_PIN (SOS) or
-// PMU_IRQ_PIN (the PWR/Bluetooth button) is pressed, whichever comes first --
-// both need to interrupt the wait immediately rather than sit out the rest
-// of a ~60s sleep. esp_light_sleep_start() preserves RAM and peripheral
-// state (unlike deep sleep), so there's nothing else here that needs
-// saving/restoring around it.
+// Light-sleeps for durationMs, or until the SOS or PWR button is pressed.
 static void lightSleepMs(uint32_t durationMs) {
 #ifdef DEBUG_NO_SLEEP
-    // Bench-debug build (env t-beam-supreme-debug): light sleep suspends native
-    // USB CDC, so serial output goes dead between cycles. Stay awake instead and
-    // poll the same two wake sources, so a monitor sees every cycle live.
-    // Rails are still gated -- only the CPU sleep is skipped, so this draws
-    // more power than the real build and is not for power measurement.
+    // Debug build: light sleep suspends USB serial, so stay awake and poll the
+    // same wake pins instead. Draws more power; not for power measurement.
     uint32_t start = millis();
     while (millis() - start < durationMs) {
         if (digitalRead(BUTTON_PIN) == LOW || digitalRead(PMU_IRQ_PIN) == LOW) {
@@ -362,12 +270,7 @@ static void holdDisplayThenSleep() {
     displaySleep();
 }
 
-// Debounces BUTTON_PIN and reports one confirmed press per press/release
-// cycle (BUTTON_PIN uses INPUT_PULLUP, so idle-high/pressed-low). Polled
-// rather than interrupt-driven so it fits the same simple model as GPS
-// acquisition below; separated from acting on the press so both the
-// acquisition loop and the top of loop() can check for one without
-// duplicating the toggle logic.
+// Debounced SOS button: true once per confirmed press.
 static bool buttonPressed() {
     bool reading = digitalRead(BUTTON_PIN);
     if (reading != lastButtonReading) {
@@ -387,17 +290,10 @@ static void handleButtonPress() {
     Serial.println(sosActive ? "SOS button pressed - beacon started" : "SOS button pressed - beacon canceled");
 }
 
-// PMU_IRQ_PIN only ever goes low for a PWR press -- see initPower(), which
-// disables every other AXP2101 IRQ source -- so this is a plain level read,
-// no debounce needed the way BUTTON_PIN needs one: the AXP2101 has already
-// qualified the press itself before raising the IRQ. clearIrqStatus()
-// releases the line back high; skipping it would leave PMU_IRQ_PIN stuck low
-// and this function permanently "pressed."
-//
-// A long press is handled here rather than returned: the hardware countdown
-// to power-off can't be aborted once started, so this just shows "Power Off"
-// for the time left and parks (the infinite loop mirrors haltWithError()).
-// It applies even while SOS is active, since the PMU cuts power regardless.
+// PMU_IRQ_PIN only goes low for a PWR press (see initPower()), already qualified
+// by the AXP2101, so no debounce. clearIrqStatus() must run or the pin stays low.
+// A long press can't be aborted, so it shows "Power Off" and parks until the PMU
+// cuts power; that applies even while SOS is active.
 static bool bluetoothButtonPressed() {
     if (digitalRead(PMU_IRQ_PIN) != LOW) {
         return false;
@@ -418,14 +314,9 @@ static bool bluetoothButtonPressed() {
     return shortPress;
 }
 
-// A separate physical button from SOS (BUTTON_PIN) on purpose, so pulling up
-// contacts on the fly can never be mistaken for -- or interfere with -- the
-// emergency button. Entering provisioning blocks the loop for potentially
-// minutes (until a phone connects and finishes, or the idle timeout), so a
-// press is flatly ignored whenever the SOS beacon is active rather than
-// queued for later -- an active SOS beacon must keep beaconing every cycle,
-// not go quiet while someone edits contacts. Never returns if it does enter,
-// since runProvisioningMode() itself only returns via esp_restart().
+// PWR short press enters BLE provisioning, on a different button from SOS on
+// purpose. It's ignored while SOS is active: provisioning can block for minutes
+// and the beacon must keep sending. Never returns if it enters.
 static void checkBluetoothButton() {
     if (!bluetoothButtonPressed()) {
         return;
@@ -438,7 +329,7 @@ static void checkBluetoothButton() {
     runProvisioningMode();
 }
 
-// Builds "lat,lng,hdop,age_ms" or "NOFIX,age_ms" if we don't have a valid fix yet.
+// "lat,lng,hdop,age_ms", or "NOFIX,age_ms" if there's no fix yet.
 static String buildLocationMessage() {
     if (!gps.location.isValid()) {
         return "NOFIX," + String(gps.location.age());
@@ -455,12 +346,8 @@ static String buildLocationMessage() {
     return message;
 }
 
-// Listens for a reply matching "ACK,<expectedId>", for as long as the
-// longest possible ACK takes to arrive at the current spreading factor plus
-// ACK_TURNAROUND_MARGIN_MS. radio.receive() blocks (with the given timeout)
-// and internally calls readData() for us, so no separate
-// startReceive()/interrupt dance is needed here -- that pattern is only for
-// continuous listening.
+// Waits for "ACK,<expectedId>" for the longest ACK's airtime at this SF plus
+// ACK_TURNAROUND_MARGIN_MS. radio.receive() blocks and reads the packet itself.
 static bool waitForAck(uint16_t expectedId) {
     static constexpr size_t kMaxAckCipherLen = 64;
     uint8_t ackCipherBuf[kMaxAckCipherLen];
@@ -500,16 +387,10 @@ static bool waitForAck(uint16_t expectedId) {
     return false;
 }
 
-// Encrypts and transmits a "<type>,<id>,<location>[,<contacts>]" packet,
-// where type is "OK" for a routine poll or "SOS" for a button-triggered
-// emergency send, and id lets waitForAck() match a reply to this specific
-// send. The trailing <contacts> field (see buildContactsForSos() in
-// ble_provisioning.cpp) rides along on every SOS send, so a responder who
-// only catches one packet of a standing beacon still learns who to notify --
-// no single packet is the one that has to get through. If it wouldn't fit
-// alongside the location, it's dropped and the location-only packet still
-// goes out: the location itself must never fail to send just because
-// someone's stored contact names ran long.
+// Sends an encrypted "<type>,<id>,<location>[,<contacts>]" packet. Type is "OK"
+// or "SOS"; id lets waitForAck() match the reply. Contacts ride on every SOS send
+// so any single packet is enough; they're dropped if too long, since the
+// location must never fail to send.
 static void sendLocationPacket(const char *type) {
     reinitDisplay();
     showStatus(type, "Sending...");
@@ -566,11 +447,8 @@ static void sendLocationPacket(const char *type) {
     holdDisplayThenSleep();
 }
 
-// Feeds GPS UART bytes to the parser until a fresh fix shows up or budgetMs
-// runs out, whichever is first. GPS is powered down between cycles (see
-// gpsRailDown()), so this is a cold acquisition every time, not a running
-// fix -- buildLocationMessage() falls back to whatever fix (possibly stale,
-// or none) TinyGPSPlus still has on hand if this times out.
+// Feeds GPS bytes to the parser until a fresh fix or budgetMs. On timeout,
+// buildLocationMessage() uses whatever fix TinyGPSPlus still has.
 static void acquireGpsFix(uint32_t budgetMs) {
     uint32_t start = millis();
     while (millis() - start < budgetMs) {
@@ -582,7 +460,7 @@ static void acquireGpsFix(uint32_t budgetMs) {
         }
         if (buttonPressed()) {
             handleButtonPress();
-            return; // don't make an SOS press wait out the rest of the budget
+            return; // don't make SOS wait out the budget
         }
         checkBluetoothButton(); // never returns if it enters provisioning
     }
@@ -590,25 +468,14 @@ static void acquireGpsFix(uint32_t budgetMs) {
 
 void setup() {
     Serial.begin(115200);
-    delay(1500); // let USB CDC come up before first prints
+    delay(1500); // let USB CDC come up
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-    // initPower() has to run before the boot-hold check, not after: it's
-    // what enables ALDO1, the rail the display (along with the BME280 and
-    // magnetometer) sits behind. runProvisioningMode() is [[noreturn]], so
-    // if the check below fires, initGPS()/initRadio() on the next lines
-    // never run at all in that boot -- only initPower() needs to happen
-    // first, since provisioning mode does its own display init but has no
-    // GPS/LoRa use for the rest of this sequence.
+    // Must run before the provisioning check: it enables the display rail (ALDO1).
     initPower();
 
-    // Holding BOOT through power-on is the only way into BLE provisioning
-    // (FW-10) from a cold boot -- see also checkBluetoothButton() for the
-    // separate on-the-fly PWR-button path during normal operation. Normal
-    // operation never has BLE running, so it doesn't touch the sleep/power
-    // budget FW-12 was built around. runProvisioningMode() itself never
-    // returns -- it esp_restart()s when done.
+    // Holding BOOT through power-on enters BLE provisioning (never returns).
     if (bootButtonHeldForProvisioning()) {
         runProvisioningMode();
     }
@@ -623,16 +490,9 @@ void setup() {
     holdDisplayThenSleep();
 }
 
-// One cycle is: check for a pending SOS press, check for a pending
-// Bluetooth-button press (see checkBluetoothButton() -- ignored outright
-// while SOS is active, otherwise this is where a routine "OK" cycle gets
-// interrupted for on-the-fly contact editing), acquire a GPS fix (bounded),
-// send, then gate the GPS/LoRa rails off and light-sleep for whatever's left
-// of SEND_INTERVAL_MS -- not a fixed sleep after a fixed acquire, since the
-// acquire+send stretch is itself variable and this keeps the overall cycle
-// close to SEND_INTERVAL_MS regardless. This is the duty cycle the report's
-// 46.93 mA average assumes; the milestone-1 loop this replaced kept the
-// CPU, GPS, and radio all fully awake for the entire interval instead.
+// One cycle: handle button presses, acquire a fix, send, cut the GPS/LoRa rails,
+// then light-sleep for the rest of SEND_INTERVAL_MS. Sleeping only the remainder
+// keeps the cycle near that interval despite variable acquire/send time.
 void loop() {
     uint32_t cycleStartMs = millis();
 

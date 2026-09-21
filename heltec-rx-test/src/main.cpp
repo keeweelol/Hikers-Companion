@@ -1,12 +1,6 @@
-// Hiker's Companion — LoRa RX bench test (Heltec WiFi LoRa 32 V3)
-//
-// Listens continuously and prints whatever it receives, plus RSSI/SNR, so we
-// can confirm the T-Beam Supreme's TX is actually reaching a second radio
-// before trusting "sent ok" on the TX side alone.
-//
-// Radio params below must match the T-Beam's main.cpp exactly (frequency,
-// bandwidth, spreading factor, coding rate) or the two sides won't hear each
-// other even though both radios are working.
+// Hiker's Companion LoRa RX bench test (Heltec WiFi LoRa 32 V3).
+// Listens continuously, prints what it receives plus RSSI/SNR, and ACKs each
+// packet. Radio params must match the T-Beam's main.cpp exactly.
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -17,7 +11,7 @@
 
 #include "hc_crypto.h"
 
-// Heltec WiFi LoRa 32 V3 SX1262 pinout (from Heltec's official pin_config.h).
+// Heltec WiFi LoRa 32 V3 SX1262 pinout (Heltec's pin_config.h).
 static constexpr int LORA_CS_PIN = 8;
 static constexpr int LORA_SCK_PIN = 9;
 static constexpr int LORA_MOSI_PIN = 10;
@@ -26,9 +20,7 @@ static constexpr int LORA_RST_PIN = 12;
 static constexpr int LORA_BUSY_PIN = 13;
 static constexpr int LORA_DIO1_PIN = 14;
 
-// Heltec V3's onboard SSD1306 OLED (also from pin_config.h). Vext gates
-// power to the OLED (and a couple other peripherals) and is off by default
-// at boot -- active LOW to enable.
+// Onboard SSD1306 OLED. Vext gates its power, off at boot; active LOW.
 static constexpr int OLED_SDA_PIN = 17;
 static constexpr int OLED_SCL_PIN = 18;
 static constexpr int OLED_RST_PIN = 21;
@@ -40,19 +32,16 @@ static constexpr uint8_t OLED_I2C_ADDR = 0x3C;
 // Must match LORA_* constants in firmware/src/main.cpp.
 static constexpr float LORA_FREQUENCY_MHZ = 915.0;
 static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
-static constexpr uint8_t LORA_SPREADING_FACTOR = 12;
+static constexpr uint8_t LORA_SPREADING_FACTOR = 7;
 static constexpr uint8_t LORA_CODING_RATE = 5;
-// Sets the power ACKs go out at. Left unset this is RadioLib's default of
-// 10 dBm, well below the T-Beam's, so the ACK leg dropped out first at range.
+// ACK power; unset, RadioLib defaults to 10 dBm and ACKs drop out first at range.
 static constexpr int8_t LORA_TX_POWER_DBM = 22;
 
 SX1262 radio = new Module(LORA_CS_PIN, LORA_DIO1_PIN, LORA_RST_PIN, LORA_BUSY_PIN);
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RST_PIN);
 
-// readData() must only be called after DIO1 actually signals RX-done -- calling
-// it on a bare polling loop reads stale FIFO contents and drops the radio out
-// of continuous receive. This ISR flag is RadioLib's documented pattern for
-// SX126x continuous receive.
+// readData() must only run after DIO1 signals RX-done; polling reads stale FIFO
+// data and drops the radio out of continuous receive.
 volatile bool packetReceived = false;
 
 static void onPacketReceived() {
@@ -92,9 +81,8 @@ static void initDisplay() {
     display.display();
 }
 
-// Panel stays off between packets to save power -- it wakes on any received
-// signal and sleeps again on a timer checked in loop() (no delay() here,
-// since that would drop packets while the radio is in continuous receive).
+// The panel wakes on each packet and sleeps on a timer checked in loop(); no
+// delay(), which would drop packets during continuous receive.
 static constexpr uint32_t DISPLAY_HOLD_MS = 5000;
 bool displayOn = false;
 bool displayOffScheduled = false;
@@ -136,10 +124,8 @@ static void showBanner(const char *line1, const char *line2) {
     display.display();
 }
 
-// Pulls one comma-separated field out of a decrypted payload (e.g. field 0
-// = "SOS", field 1 = "42" from "SOS,42,37.774900,-122.419400,1.2,340")
-// without assuming it's null-terminated -- hcDecrypt() only guarantees
-// plainLen valid bytes.
+// Copies one comma-separated field of a decrypted payload into out. The payload
+// isn't null-terminated, so it's bounded by len.
 static void splitField(const uint8_t *data, size_t len, int fieldIndex, char *out, size_t outSize) {
     size_t fieldStart = 0;
     int currentField = 0;
@@ -161,20 +147,10 @@ static void splitField(const uint8_t *data, size_t len, int fieldIndex, char *ou
     out[0] = '\0';
 }
 
-// Encrypts and transmits "ACK,<id>" back to whoever sent the message we
-// just received -- id lets the sender's waitForAck() match this reply to
-// its specific send. Interrupts the ongoing continuous receive, same as
-// any other radio.transmit() call; loop() re-arms it with startReceive()
-// right after, same as it already does for every other branch here.
-//
-// setDio1Action()'s callback fires on ANY rising edge on that pin, with no
-// idea whether the chip currently means RX-done or TX-done by it -- so this
-// transmit's own TX-done pulse sets packetReceived = true too. Left alone,
-// the next loop() iteration would treat that as a real receive and read
-// whatever's left in the shared TX/RX buffer (part fresh ACK ciphertext,
-// part leftover tail from the packet we just processed), which reliably
-// fails the GCM auth check but is still a spurious, printed failure. Clear
-// the flag afterward so our own ACKs can't be mistaken for incoming packets.
+// Sends an encrypted "ACK,<id>" so the sender's waitForAck() can match it.
+// loop() re-arms receive afterward. The DIO1 callback fires on any rising edge,
+// including this transmit's own TX-done, so packetReceived is cleared after to
+// avoid reading our own ACK as an incoming packet.
 static void sendAck(const char *id) {
     String payload = String("ACK,") + id;
 
@@ -203,8 +179,7 @@ static void sendAck(const char *id) {
     }
 }
 
-// SOS gets top billing (large text) since that's the one thing worth seeing
-// at a glance; RSSI/SNR are secondary detail for range testing.
+// The message type is large; RSSI/SNR are secondary detail for range testing.
 static void showReceived(const char *type, float rssi, float snr) {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
@@ -269,11 +244,8 @@ void loop() {
     displayWake();
     scheduleDisplayOff(DISPLAY_HOLD_MS);
 
-    // Must stay >= the T-Beam's kMaxPlaintextLen (160) + HC_GCM_NONCE_LEN +
-    // HC_GCM_TAG_LEN (188 total) -- every SOS transmission rides a
-    // stored-contacts field alongside the location (see sendLocationPacket()
-    // in firmware/src/main.cpp), which needs more room than the plain
-    // location-only packets this was originally sized for.
+    // Must stay >= the T-Beam's kMaxPlaintextLen (160) + nonce + tag (188 total);
+    // SOS packets carry the contact list.
     static constexpr size_t kMaxCipherLen = 192;
     size_t cipherLen = radio.getPacketLength();
 
@@ -305,8 +277,7 @@ void loop() {
             splitField(plainBuf, plainLen, 0, type, sizeof(type));
             splitField(plainBuf, plainLen, 1, id, sizeof(id));
 
-            // Sent before the display update to keep ACK latency low against
-            // the sender's fixed listen window.
+            // Sent before the display update to keep ACK latency low.
             sendAck(id);
             showReceived(type, radio.getRSSI(), radio.getSNR());
         }

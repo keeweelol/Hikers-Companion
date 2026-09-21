@@ -2,30 +2,18 @@
 
 #include <WString.h>
 
-// Emergency-contact BLE provisioning mode (FW-10). Two ways in: holding
-// BOOT through power-on (bootButtonHeldForProvisioning(), checked once at
-// the top of setup()), or short-pressing the separate PWR button during
-// normal operation (checkBluetoothButton() in main.cpp, checked every cycle
-// but ignored outright while the SOS beacon is active). Either way, the BLE
-// radio only ever runs inside runProvisioningMode() itself -- normal
-// operation doesn't touch the sleep/power budget FW-12 was built around.
+// Emergency-contact BLE provisioning (FW-10). Entered by holding BOOT through
+// power-on, or by a short PWR press during normal operation (ignored while SOS
+// is active). BLE only runs inside runProvisioningMode().
 
-// True if BUTTON_PIN has been held down continuously for PROVISION_HOLD_MS.
-// Must be called at the very top of setup(), before initPower()/initGPS()/
-// initRadio() touch anything else, while the pin still just reads the
-// physical button with nothing else driving it.
+// True if BUTTON_PIN is held down for PROVISION_HOLD_MS. Call at the top of
+// setup(), while the pin still just reads the physical button.
 bool bootButtonHeldForProvisioning();
 
-// Runs a BLE GATT server that lets a phone read/write the emergency contact
-// list stored in NVS, blocking until provisioning ends -- the client writes
-// "DONE", the phone disconnects after a session, BOOT is pressed again, or
-// PROVISION_IDLE_TIMEOUT_MS passes with no connection ever made -- then
-// esp_restart()s back into normal firmware. Never returns.
+// Runs a BLE server for editing the contact list in NVS, then esp_restart()s.
+// Ends on "DONE", a disconnect, a BOOT press, or the idle timeout. Never returns.
 [[noreturn]] void runProvisioningMode();
 
-// Compact "name:phone;name:phone;..." summary of the stored emergency
-// contacts, empty slots skipped, for embedding in every SOS packet (see
-// sendLocationPacket() in main.cpp). Opens, reads, and closes NVS itself in
-// one call, so it's safe to call from normal operation with no provisioning
-// session active. Empty string if no contacts have ever been stored.
+// "name:phone;name:phone;..." of stored contacts (empty slots skipped), sent in
+// every SOS packet. Empty string if none are stored. Safe to call outside a session.
 String buildContactsForSos();
