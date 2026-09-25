@@ -18,10 +18,14 @@
 #include "pins.h"
 
 // ---- Radio configuration ----
-// US902-928 MHz ISM band. SF must match the Heltec receiver.
+// US902-928 MHz ISM band. SF must match the Heltec receiver. Set per build with
+// -DLORA_SF=<7-12> (see the *-sfN envs in platformio.ini); defaults to 10.
+#ifndef LORA_SF
+#define LORA_SF 10
+#endif
 static constexpr float LORA_FREQUENCY_MHZ = 915.0;
 static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
-static constexpr uint8_t LORA_SPREADING_FACTOR = 7;
+static constexpr uint8_t LORA_SPREADING_FACTOR = LORA_SF;
 static constexpr uint8_t LORA_CODING_RATE = 5;
 static constexpr int8_t LORA_TX_POWER_DBM = 22; // SX1262 max
 
@@ -513,7 +517,7 @@ void setup() {
 
     displayWake();
     showStatus("Hiker's Companion", "Ready");
-    Serial.println("Hiker's Companion - GPS/LoRa send loop ready");
+    Serial.printf("Hiker's Companion - GPS/LoRa send loop ready (SF%d)\n", LORA_SPREADING_FACTOR);
     holdDisplayThenSleep();
 }
 
