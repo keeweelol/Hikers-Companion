@@ -109,6 +109,10 @@ static void initPower() {
     PMU->setPowerChannelVoltage(XPOWERS_ALDO1, 3300); // Display (+ BME280 + magnetometer) rail
     PMU->enablePowerOutput(XPOWERS_ALDO1);
 
+    // Needed for the battery percentage to read correctly.
+    PMU->enableBattDetection();
+    PMU->enableBattVoltageMeasure();
+
     // The PWR button is the AXP2101 power key, reported by PMU_IRQ_PIN going low.
     // Only its IRQs are enabled. A long press starts a hardware power-off
     // countdown (4s) that firmware can't abort.
@@ -178,11 +182,26 @@ static void displaySleep() {
     }
 }
 
-// line1 is small context (message type); line2 is the big status word.
+// "Bat 87% CHG" while charging, "Bat 87% USB" if plugged in but not charging
+// (full), "Bat 87%" on battery alone, or "No battery".
+static void batteryLine(char *out, size_t size) {
+    if (!PMU->isBatteryConnect()) {
+        snprintf(out, size, "No battery");
+        return;
+    }
+    const char *state = PMU->isCharging() ? " CHG" : (PMU->isVbusIn() ? " USB" : "");
+    snprintf(out, size, "Bat %d%%%s", PMU->getBatteryPercent(), state);
+}
+
+// line1 is small context (message type); line2 is the big status word; the
+// bottom line is battery status.
 static void showStatus(const char *line1, const char *line2) {
     if (!displayAvailable) {
         return;
     }
+    char battery[24];
+    batteryLine(battery, sizeof(battery));
+
     display.clearDisplay();
     display.setTextColor(SH110X_WHITE);
 
@@ -193,6 +212,10 @@ static void showStatus(const char *line1, const char *line2) {
     display.setTextSize(2);
     display.setCursor(0, 20);
     display.print(line2);
+
+    display.setTextSize(1);
+    display.setCursor(0, 52);
+    display.print(battery);
 
     display.display();
 }
@@ -394,6 +417,10 @@ static bool waitForAck(uint16_t expectedId) {
 static void sendLocationPacket(const char *type) {
     reinitDisplay();
     showStatus(type, "Sending...");
+
+    char battery[24];
+    batteryLine(battery, sizeof(battery));
+    Serial.printf("  battery: %s\n", battery);
 
     uint16_t msgId = nextMessageId++;
     String payload = String(type) + "," + String(msgId) + "," + buildLocationMessage();
