@@ -1,6 +1,7 @@
 // Hiker's Companion firmware for the LILYGO T-Beam Supreme (ESP32-S3, SX1262, AXP2101, GNSS).
 // Sends GPS location over LoRa on an interval, with SOS button, OLED status, and delivery ACK.
-// Between sends the GPS/LoRa rails are cut and the ESP32 light-sleeps (see loop()).
+// Between sends the LoRa rail is cut and the ESP32 light-sleeps (see loop()). The GPS
+// rail follows its own schedule (see GpsMode).
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
@@ -41,10 +42,21 @@ static constexpr size_t kMaxAckPlainLen = 9;
 // GPIO0 has no hardware debounce.
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
 
-// GPS is cold-started every cycle; 25s is a placeholder pending real TTFF data.
-static constexpr uint32_t GPS_ACQUIRE_BUDGET_MS = 25000;
+// GPS timing. All are placeholders pending real L76K data from the "GPS fix" log lines.
+// Wait for a hot start after powering up from backup; a miss drops back to Acquire.
+static constexpr uint32_t GPS_HOT_START_BUDGET_MS = 10000;
+// Wait when the GPS was already on: long enough to catch a fresh 1 Hz NMEA fix.
+static constexpr uint32_t GPS_READ_WINDOW_MS = 3000;
+// Stay on this long past the first fix so the full ephemeris downloads.
+static constexpr uint32_t GPS_SETTLE_MS = 60000;
+// Ephemeris goes stale after ~2-4 h; re-acquire (and re-settle) before then.
+static constexpr uint32_t GPS_EPHEMERIS_REFRESH_MS = 2UL * 60 * 60 * 1000;
+// No sky (indoors): stop searching after this long, rest, then try again.
+static constexpr uint32_t GPS_ACQUIRE_GIVE_UP_MS = 10UL * 60 * 1000;
+static constexpr uint32_t GPS_ACQUIRE_REST_MS = 10UL * 60 * 1000;
 
-// SOS gets a short window: getting the packet out beats a precise fix.
+// The first SOS send after a press gets a short window: getting the alert out beats
+// a precise fix. Later SOS sends use the normal windows.
 static constexpr uint32_t GPS_ACQUIRE_QUICK_MS = 2000;
 
 // ---- Globals ----
@@ -77,6 +89,23 @@ uint32_t lastButtonChangeMs = 0;
 
 // A press starts a standing SOS beacon (every send flagged "SOS"); a second press cancels it.
 bool sosActive = false;
+// Set by an SOS start, cleared once that first SOS packet has been sent.
+bool sosFirstSendPending = false;
+
+// The L76K has no built-in power-save mode, so firmware schedules its rail (ALDO4):
+//   Acquire: rail stays on, even through light sleep, until a fix.
+//   Settle:  stays on GPS_SETTLE_MS past the fix so the full ephemeris downloads.
+//   Backup:  rail off between sends. The GNSS backup supply comes straight from the
+//            18650, so ephemeris and RTC survive and each send is a hot start.
+//            With no 18650 (USB only) every power-up is a cold start.
+//   Rest:    rail off after GPS_ACQUIRE_GIVE_UP_MS without a fix.
+// SOS follows the same schedule, except it never gives up searching (and wakes Rest).
+enum class GpsMode : uint8_t { Acquire, Settle, Backup, Rest };
+GpsMode gpsMode = GpsMode::Acquire;
+uint32_t gpsModeStartMs = 0;
+bool gpsPowered = false;
+uint32_t gpsPowerOnMs = 0;
+uint32_t gpsEphemerisMs = 0; // when the last Settle finished
 
 static void printHex(const char *label, const uint8_t *data, size_t len) {
     Serial.print(label);
@@ -244,6 +273,8 @@ static void initRadio() {
 static void gpsRailDown() {
     digitalWrite(GPS_EN_PIN, LOW); // don't drive EN into an unpowered chip
     PMU->disablePowerOutput(XPOWERS_ALDO4);
+    gpsPowered = false;
+    Serial.println("  GPS rail down (backup supply keeps ephemeris)");
 }
 
 static void radioRailDown() {
@@ -257,6 +288,9 @@ static void gpsRailUp() {
     PMU->enablePowerOutput(XPOWERS_ALDO4);
     delay(10);
     initGPS();
+    gpsPowered = true;
+    gpsPowerOnMs = millis();
+    Serial.println("  GPS rail up");
 }
 
 static void radioRailUp() {
@@ -314,6 +348,7 @@ static bool buttonPressed() {
 
 static void handleButtonPress() {
     sosActive = !sosActive;
+    sosFirstSendPending = sosActive;
     Serial.println(sosActive ? "SOS button pressed - beacon started" : "SOS button pressed - beacon canceled");
 }
 
@@ -478,22 +513,116 @@ static void sendLocationPacket(const char *type) {
     holdDisplayThenSleep();
 }
 
-// Feeds GPS bytes to the parser until a fresh fix or budgetMs. On timeout,
-// buildLocationMessage() uses whatever fix TinyGPSPlus still has.
-static void acquireGpsFix(uint32_t budgetMs) {
+static bool hasFreshFix() {
+    return gps.location.isValid() && gps.location.age() < 2000;
+}
+
+// Feeds GPS bytes to the parser until a fresh fix or budgetMs; true on a fresh fix.
+// On timeout, buildLocationMessage() uses whatever fix TinyGPSPlus still has.
+static bool acquireGpsFix(uint32_t budgetMs) {
+    // Drop bytes buffered before light sleep: parsed now, they'd look fresh.
+    while (SerialGPS.available() > 0) {
+        SerialGPS.read();
+    }
     uint32_t start = millis();
     while (millis() - start < budgetMs) {
         while (SerialGPS.available() > 0) {
             gps.encode(SerialGPS.read());
         }
-        if (gps.location.isValid() && gps.location.age() < 2000) {
-            return;
+        if (hasFreshFix()) {
+            return true;
         }
         if (buttonPressed()) {
             handleButtonPress();
-            return; // don't make SOS wait out the budget
+            return false; // don't make SOS wait out the budget
         }
         checkBluetoothButton(); // never returns if it enters provisioning
+    }
+    return false;
+}
+
+static const char *gpsModeName(GpsMode mode) {
+    switch (mode) {
+    case GpsMode::Acquire: return "acquire";
+    case GpsMode::Settle: return "settle";
+    case GpsMode::Backup: return "backup";
+    case GpsMode::Rest: return "rest";
+    }
+    return "?";
+}
+
+static void enterGpsMode(GpsMode mode) {
+    Serial.printf("  GPS mode %s -> %s\n", gpsModeName(gpsMode), gpsModeName(mode));
+    gpsMode = mode;
+    gpsModeStartMs = millis();
+}
+
+// Start of a cycle: applies time-based mode changes, powers the GPS if this cycle
+// reads it, and returns how long to wait for a fix (0 = skip, GPS resting).
+static uint32_t gpsBeginCycle() {
+    uint32_t now = millis();
+    if (gpsMode == GpsMode::Backup && now - gpsEphemerisMs >= GPS_EPHEMERIS_REFRESH_MS) {
+        Serial.println("  GPS ephemeris due for refresh");
+        enterGpsMode(GpsMode::Acquire);
+    }
+    if (gpsMode == GpsMode::Rest && (sosActive || now - gpsModeStartMs >= GPS_ACQUIRE_REST_MS)) {
+        enterGpsMode(GpsMode::Acquire);
+    }
+    if (gpsMode == GpsMode::Rest) {
+        return 0;
+    }
+    if (!gpsPowered) {
+        gpsRailUp();
+    }
+    if (sosFirstSendPending) {
+        return GPS_ACQUIRE_QUICK_MS;
+    }
+    return gpsMode == GpsMode::Backup ? GPS_HOT_START_BUDGET_MS : GPS_READ_WINDOW_MS;
+}
+
+// After the fix attempt: logs time-to-fix, advances the mode, and cuts the rail
+// if the new mode doesn't need it. Runs before the send so the GPS isn't powered
+// through the send and display hold. Only a miss over the full hot-start budget
+// counts as a failed hot start; a short SOS window or button interrupt doesn't.
+static void gpsEndCycle(bool gotFix, uint32_t waitedMs) {
+    uint32_t now = millis();
+    if (gotFix) {
+        Serial.printf("  GPS fix [%s] in %u ms, %u ms since power-on, %u sats, hdop %.1f\n",
+                      gpsModeName(gpsMode), (unsigned)waitedMs, (unsigned)(now - gpsPowerOnMs),
+                      (unsigned)gps.satellites.value(), gps.hdop.hdop());
+    } else if (gpsPowered) {
+        Serial.printf("  GPS no fix [%s] after %u ms, %u ms since power-on\n",
+                      gpsModeName(gpsMode), (unsigned)waitedMs, (unsigned)(now - gpsPowerOnMs));
+    }
+
+    switch (gpsMode) {
+    case GpsMode::Acquire:
+        if (gotFix) {
+            enterGpsMode(GpsMode::Settle);
+        } else if (!sosActive && now - gpsModeStartMs >= GPS_ACQUIRE_GIVE_UP_MS) {
+            Serial.println("  GPS gave up searching, resting");
+            enterGpsMode(GpsMode::Rest);
+        }
+        break;
+    case GpsMode::Settle:
+        if (now - gpsModeStartMs >= GPS_SETTLE_MS) {
+            gpsEphemerisMs = now;
+            enterGpsMode(GpsMode::Backup);
+        }
+        break;
+    case GpsMode::Backup:
+        if (!gotFix && waitedMs >= GPS_HOT_START_BUDGET_MS) {
+            Serial.println("  GPS hot start missed, staying on");
+            enterGpsMode(GpsMode::Acquire);
+        }
+        break;
+    case GpsMode::Rest:
+        break;
+    }
+
+    bool railNeeded = gpsMode == GpsMode::Acquire || gpsMode == GpsMode::Settle;
+    if (gpsPowered && !railNeeded) {
+        gpsRailDown();
     }
 }
 
@@ -511,7 +640,8 @@ void setup() {
         runProvisioningMode();
     }
 
-    initGPS();
+    gpsRailUp(); // ALDO4 is already on from initPower(); this records power-on time
+    gpsModeStartMs = millis();
     initRadio();
     initDisplay();
 
@@ -521,9 +651,9 @@ void setup() {
     holdDisplayThenSleep();
 }
 
-// One cycle: handle button presses, acquire a fix, send, cut the GPS/LoRa rails,
-// then light-sleep for the rest of SEND_INTERVAL_MS. Sleeping only the remainder
-// keeps the cycle near that interval despite variable acquire/send time.
+// One cycle: handle button presses, try for a fix, update the GPS schedule, send,
+// cut the LoRa rail, then light-sleep for the rest of SEND_INTERVAL_MS. Sleeping
+// only the remainder keeps the cycle near that interval despite variable acquire/send time.
 void loop() {
     uint32_t cycleStartMs = millis();
 
@@ -532,16 +662,21 @@ void loop() {
     }
     checkBluetoothButton(); // never returns if it enters provisioning
 
-    acquireGpsFix(sosActive ? GPS_ACQUIRE_QUICK_MS : GPS_ACQUIRE_BUDGET_MS);
-    sendLocationPacket(sosActive ? "SOS" : "OK");
+    uint32_t budgetMs = gpsBeginCycle();
+    uint32_t acquireStartMs = millis();
+    bool gotFix = budgetMs > 0 && acquireGpsFix(budgetMs);
+    gpsEndCycle(gotFix, millis() - acquireStartMs);
 
-    gpsRailDown();
+    sendLocationPacket(sosActive ? "SOS" : "OK");
+    if (sosActive) {
+        sosFirstSendPending = false;
+    }
+
     radioRailDown();
 
     uint32_t elapsedMs = millis() - cycleStartMs;
     uint32_t sleepMs = elapsedMs < SEND_INTERVAL_MS ? SEND_INTERVAL_MS - elapsedMs : 0;
     lightSleepMs(sleepMs);
 
-    gpsRailUp();
     radioRailUp();
 }
