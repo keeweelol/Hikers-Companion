@@ -147,12 +147,16 @@ static void initPower() {
     PMU->enableBattVoltageMeasure();
 
     // The PWR button is the AXP2101 power key, reported by PMU_IRQ_PIN going low.
-    // Only its IRQs are enabled. A long press starts a hardware power-off
-    // countdown (4s) that firmware can't abort.
+    // Only its IRQs are enabled. The long-press IRQ fires after ~2s and the
+    // firmware then calls PMU->shutdown(). Holding for the full 4s also powers
+    // off in hardware, as a backstop if the firmware is hung.
     PMU->disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
     PMU->clearIrqStatus();
     PMU->enableIRQ(XPOWERS_AXP2101_PKEY_SHORT_IRQ | XPOWERS_AXP2101_PKEY_LONG_IRQ);
     PMU->setPowerKeyPressOffTime(XPOWERS_POWEROFF_4S);
+    // Only on the concrete class; PMU is always created as XPowersAXP2101 above.
+    static_cast<XPowersAXP2101 *>(PMU)->setLongPressPowerOFF();
+    static_cast<XPowersAXP2101 *>(PMU)->enableLongPressShutdown();
     pinMode(PMU_IRQ_PIN, INPUT_PULLUP);
 }
 
@@ -377,6 +381,10 @@ static bool bluetoothButtonPressed() {
         Serial.println("PWR long-press - shutting down");
         reinitDisplay();
         showStatus("Power", "Off");
+        delay(1500); // long enough to read the message
+        displaySleep();
+        Serial.flush();
+        PMU->shutdown(); // cuts every rail, ESP32 included; a PWR press turns it back on
         while (true) {
             delay(100);
         }
