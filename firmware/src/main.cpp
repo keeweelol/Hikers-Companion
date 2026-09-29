@@ -300,14 +300,43 @@ static void radioRailUp() {
     initRadio();
 }
 
+// Debounced SOS button: true once per confirmed press.
+static bool buttonPressed() {
+    bool reading = digitalRead(BUTTON_PIN);
+    if (reading != lastButtonReading) {
+        lastButtonChangeMs = millis();
+        lastButtonReading = reading;
+    }
+
+    if (millis() - lastButtonChangeMs > BUTTON_DEBOUNCE_MS && reading != buttonState) {
+        buttonState = reading;
+        return buttonState == LOW;
+    }
+    return false;
+}
+
+static void handleButtonPress() {
+    sosActive = !sosActive;
+    sosFirstSendPending = sosActive;
+    Serial.println(sosActive ? "SOS button pressed - beacon started" : "SOS button pressed - beacon canceled");
+}
+
 // Light-sleeps for durationMs, or until the SOS or PWR button is pressed.
 static void lightSleepMs(uint32_t durationMs) {
 #ifdef DEBUG_NO_SLEEP
-    // Debug build: light sleep suspends USB serial, so stay awake and poll the
-    // same wake pins instead. Draws more power; not for power measurement.
+    // Debug build: light sleep suspends USB serial, so stay awake and poll
+    // instead. Polls through buttonPressed()/handleButtonPress() rather than a
+    // raw digitalRead, so SOS debounce state stays in sync with the rest of the
+    // firmware -- a raw read here let a press start and end entirely inside this
+    // wait without buttonPressed() ever seeing it, which could silently swallow
+    // a tap depending on exactly when the next real buttonPressed() call landed.
     uint32_t start = millis();
     while (millis() - start < durationMs) {
-        if (digitalRead(BUTTON_PIN) == LOW || digitalRead(PMU_IRQ_PIN) == LOW) {
+        if (buttonPressed()) {
+            handleButtonPress();
+            return;
+        }
+        if (digitalRead(PMU_IRQ_PIN) == LOW) {
             return;
         }
         delay(10);
@@ -329,27 +358,6 @@ static void lightSleepMs(uint32_t durationMs) {
 static void holdDisplayThenSleep() {
     lightSleepMs(DISPLAY_HOLD_MS);
     displaySleep();
-}
-
-// Debounced SOS button: true once per confirmed press.
-static bool buttonPressed() {
-    bool reading = digitalRead(BUTTON_PIN);
-    if (reading != lastButtonReading) {
-        lastButtonChangeMs = millis();
-        lastButtonReading = reading;
-    }
-
-    if (millis() - lastButtonChangeMs > BUTTON_DEBOUNCE_MS && reading != buttonState) {
-        buttonState = reading;
-        return buttonState == LOW;
-    }
-    return false;
-}
-
-static void handleButtonPress() {
-    sosActive = !sosActive;
-    sosFirstSendPending = sosActive;
-    Serial.println(sosActive ? "SOS button pressed - beacon started" : "SOS button pressed - beacon canceled");
 }
 
 // PMU_IRQ_PIN only goes low for a PWR press (see initPower()), already qualified
