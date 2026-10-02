@@ -18,6 +18,9 @@
 #include "hc_crypto.h"
 #include "pins.h"
 
+// Bump this alongside the git tag (vX.Y.Z) for each release.
+static constexpr char FIRMWARE_VERSION[] = "0.5.0";
+
 // ---- Radio configuration ----
 // US902-928 MHz ISM band. SF must match the Heltec receiver. Set per build with
 // -DLORA_SF=<7-12> (see the *-sfN envs in platformio.ini); defaults to 10.
@@ -662,8 +665,10 @@ void setup() {
     initDisplay();
 
     displayWake();
-    showStatus("Hiker's Companion", "Ready");
-    Serial.printf("Hiker's Companion - GPS/LoRa send loop ready (SF%d)\n", LORA_SPREADING_FACTOR);
+    char bootLine[24];
+    snprintf(bootLine, sizeof(bootLine), "Hiker's Comp v%s", FIRMWARE_VERSION);
+    showStatus(bootLine, "Ready");
+    Serial.printf("Hiker's Companion v%s - GPS/LoRa send loop ready (SF%d)\n", FIRMWARE_VERSION, LORA_SPREADING_FACTOR);
     holdDisplayThenSleep();
 }
 
