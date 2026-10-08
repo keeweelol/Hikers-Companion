@@ -10,7 +10,7 @@ Also separate: `../heltec-rx-test/`, a throwaway RX bench rig on a Heltec
 WiFi LoRa 32 V3 used to confirm this board's LoRa TX is actually reaching a
 second radio — decrypted payload + RSSI/SNR go to both serial and the
 Heltec's onboard SSD1306 OLED, which wakes for 5s on each received signal
-and sleeps otherwise. It also replies with an `ACK,<id>` for every valid
+and sleeps otherwise. It also replies with an `ACK,<node>,<id>` for every valid
 packet it decrypts, which is what makes the T-Beam's "Delivered" status
 real (see FW-06 below). Not part of the product firmware.
 
@@ -31,8 +31,10 @@ see `sendLocationPacket()` / `buttonPressed()` in `src/main.cpp`.
 An SH1106 OLED (I2C, pins 17/18) shows live status via `showStatus()`:
 message type on top, "Sending" / "Delivered" / "No ACK" / "Send failed"
 below. "Delivered" is now a real ACK, not an assumption: each packet carries
-a small message id (`<type>,<id>,<location>`), and after transmitting, the
-T-Beam listens for a matching `ACK,<id>` for up to the ACK's own airtime at
+the sender's node ID and a message id (`<type>,<node>,<id>,<location>`; node
+is the `NODE_ID` build flag, default 1), and after transmitting, the T-Beam
+listens for a matching `ACK,<node>,<id>` (matched on both, so one sender can't
+accept another's ACK) for up to the ACK's own airtime at
 the current spreading factor plus `ACK_TURNAROUND_MARGIN_MS` (computed in
 `waitForAck()`, so the window grows automatically from SF7 to SF12)
 reply from the Heltec RX rig (`waitForAck()`/`sendAck()`). A timeout with no

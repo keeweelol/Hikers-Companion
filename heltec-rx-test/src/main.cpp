@@ -38,8 +38,12 @@ static constexpr float LORA_FREQUENCY_MHZ = 915.0;
 static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
 static constexpr uint8_t LORA_SPREADING_FACTOR = LORA_SF;
 static constexpr uint8_t LORA_CODING_RATE = 5;
-// ACK power; unset, RadioLib defaults to 10 dBm and ACKs drop out first at range.
-static constexpr int8_t LORA_TX_POWER_DBM = 22;
+// ACK power, set per build like LORA_SF. Unset in RadioLib it would default to
+// 10 dBm, and ACKs dropped out first at range.
+#ifndef LORA_TX_POWER
+#define LORA_TX_POWER 22
+#endif
+static constexpr int8_t LORA_TX_POWER_DBM = LORA_TX_POWER;
 
 SX1262 radio = new Module(LORA_CS_PIN, LORA_DIO1_PIN, LORA_RST_PIN, LORA_BUSY_PIN);
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RST_PIN);
@@ -52,7 +56,14 @@ static void onPacketReceived() {
     packetReceived = true;
 }
 
+// Prefixes receive-path log lines with millis() so the receiver and transmitter
+// logs from a test run can be lined up.
+static void logStamp() {
+    Serial.printf("[%lu] ", (unsigned long)millis());
+}
+
 static void printHex(const char *label, const uint8_t *data, size_t len) {
+    logStamp();
     Serial.print(label);
     for (size_t i = 0; i < len; i++) {
         Serial.printf("%02x", data[i]);
@@ -151,17 +162,18 @@ static void splitField(const uint8_t *data, size_t len, int fieldIndex, char *ou
     out[0] = '\0';
 }
 
-// Sends an encrypted "ACK,<id>" so the sender's waitForAck() can match it.
-// loop() re-arms receive afterward. The DIO1 callback fires on any rising edge,
-// including this transmit's own TX-done, so packetReceived is cleared after to
-// avoid reading our own ACK as an incoming packet.
-static void sendAck(const char *id) {
-    String payload = String("ACK,") + id;
+// Sends an encrypted "ACK,<node>,<id>" so only the sending node's waitForAck()
+// matches it. loop() re-arms receive afterward. The DIO1 callback fires on any
+// rising edge, including this transmit's own TX-done, so packetReceived is
+// cleared after to avoid reading our own ACK as an incoming packet.
+static void sendAck(const char *node, const char *id) {
+    String payload = String("ACK,") + node + "," + id;
 
     static constexpr size_t kMaxPlaintextLen = 32;
     uint8_t plainBuf[kMaxPlaintextLen];
     size_t plainLen = payload.length();
     if (plainLen > kMaxPlaintextLen) {
+        logStamp();
         Serial.println("  ACK payload too long, dropping");
         return;
     }
@@ -170,14 +182,16 @@ static void sendAck(const char *id) {
     uint8_t cipherBuf[kMaxPlaintextLen + HC_GCM_NONCE_LEN + HC_GCM_TAG_LEN];
     size_t cipherLen = hcEncrypt(plainBuf, plainLen, cipherBuf);
     if (cipherLen == 0) {
+        logStamp();
         Serial.println("  ACK encrypt failed");
         return;
     }
 
     int state = radio.transmit(cipherBuf, cipherLen);
     packetReceived = false; // discard any spurious flag set by this transmit's own TX-done IRQ
+    logStamp();
     if (state == RADIOLIB_ERR_NONE) {
-        Serial.printf("  ACK sent for id %s\n", id);
+        Serial.printf("  ACK sent for node %s id %s\n", node, id);
     } else {
         Serial.printf("  ACK send failed, code %d\n", state);
     }
@@ -232,7 +246,8 @@ void setup() {
     showBanner("Heltec RX", "Listening...");
     scheduleDisplayOff(DISPLAY_HOLD_MS);
 
-    Serial.printf("Heltec LoRa RX test ready - listening for T-Beam packets (SF%d)\n", LORA_SPREADING_FACTOR);
+    Serial.printf("Heltec LoRa RX test ready - listening for T-Beam packets (SF%d, %d dBm ACKs)\n",
+                  LORA_SPREADING_FACTOR, LORA_TX_POWER_DBM);
 }
 
 void loop() {
@@ -254,6 +269,7 @@ void loop() {
     size_t cipherLen = radio.getPacketLength();
 
     if (cipherLen == 0 || cipherLen > kMaxCipherLen) {
+        logStamp();
         Serial.printf("RX: bad packet length %u, dropped\n", (unsigned)cipherLen);
         radio.startReceive();
         return;
@@ -269,26 +285,33 @@ void loop() {
         size_t plainLen = hcDecrypt(cipherBuf, cipherLen, plainBuf);
 
         if (plainLen == 0) {
+            logStamp();
             Serial.println("RX: decrypt/auth failed - corrupted, tampered, or wrong key");
             showBanner("Heltec RX", "AUTH FAIL");
         } else {
+            logStamp();
             Serial.print("RX: ");
             Serial.write(plainBuf, plainLen);
             Serial.printf("  (RSSI %.1f dBm, SNR %.1f dB)\n", radio.getRSSI(), radio.getSNR());
 
+            // Payload is "<type>,<node>,<id>,<location>[,<contacts>]".
             char type[16];
+            char node[8];
             char id[16];
             splitField(plainBuf, plainLen, 0, type, sizeof(type));
-            splitField(plainBuf, plainLen, 1, id, sizeof(id));
+            splitField(plainBuf, plainLen, 1, node, sizeof(node));
+            splitField(plainBuf, plainLen, 2, id, sizeof(id));
 
             // Sent before the display update to keep ACK latency low.
-            sendAck(id);
+            sendAck(node, id);
             showReceived(type, radio.getRSSI(), radio.getSNR());
         }
     } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
+        logStamp();
         Serial.println("RX: CRC mismatch, dropped");
         showBanner("Heltec RX", "CRC FAIL");
     } else {
+        logStamp();
         Serial.printf("readData failed, code %d\n", state);
         showBanner("Heltec RX", "RX ERROR");
     }

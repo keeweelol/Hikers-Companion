@@ -31,16 +31,32 @@ static constexpr float LORA_FREQUENCY_MHZ = 915.0;
 static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
 static constexpr uint8_t LORA_SPREADING_FACTOR = LORA_SF;
 static constexpr uint8_t LORA_CODING_RATE = 5;
-static constexpr int8_t LORA_TX_POWER_DBM = 22; // SX1262 max
 
-static constexpr uint32_t SEND_INTERVAL_MS = 60000;
+// TX power, send interval, and node ID are build flags so test envs can override
+// them (see the contention-* envs in platformio.ini) without touching these defaults.
+#ifndef LORA_TX_POWER
+#define LORA_TX_POWER 22 // SX1262 max
+#endif
+static constexpr int8_t LORA_TX_POWER_DBM = LORA_TX_POWER;
+
+#ifndef SEND_INTERVAL
+#define SEND_INTERVAL 60000
+#endif
+static constexpr uint32_t SEND_INTERVAL_MS = SEND_INTERVAL;
+
+// Sent in every packet and echoed in the ACK, so the receiver can tell senders
+// apart and a sender never accepts an ACK meant for another node with the same id.
+#ifndef NODE_ID
+#define NODE_ID 1
+#endif
+static constexpr uint8_t kNodeId = NODE_ID;
 
 // ACK listen window = ACK airtime at the current SF (computed in waitForAck())
 // plus this margin for the receiver's decrypt/print/turnaround.
 static constexpr uint32_t ACK_TURNAROUND_MARGIN_MS = 750;
 
-// Longest ACK plaintext is "ACK,65535" (message ids are uint16_t).
-static constexpr size_t kMaxAckPlainLen = 9;
+// Longest ACK plaintext is "ACK,255,65535" (node is uint8_t, message id uint16_t).
+static constexpr size_t kMaxAckPlainLen = 13;
 
 // GPIO0 has no hardware debounce.
 static constexpr uint32_t BUTTON_DEBOUNCE_MS = 50;
@@ -427,8 +443,8 @@ static String buildLocationMessage() {
     return message;
 }
 
-// Waits for "ACK,<expectedId>" for the longest ACK's airtime at this SF plus
-// ACK_TURNAROUND_MARGIN_MS. radio.receive() blocks and reads the packet itself.
+// Waits for "ACK,<kNodeId>,<expectedId>" for the longest ACK's airtime at this SF
+// plus ACK_TURNAROUND_MARGIN_MS. radio.receive() blocks and reads the packet itself.
 static bool waitForAck(uint16_t expectedId) {
     static constexpr size_t kMaxAckCipherLen = 64;
     uint8_t ackCipherBuf[kMaxAckCipherLen];
@@ -458,9 +474,10 @@ static bool waitForAck(uint16_t expectedId) {
     memcpy(ackStr, ackPlainBuf, copyLen);
     ackStr[copyLen] = '\0';
 
+    int ackNode = -1;
     int ackId = -1;
-    if (sscanf(ackStr, "ACK,%d", &ackId) == 1 && ackId == expectedId) {
-        Serial.printf("  ACK received for id %d\n", ackId);
+    if (sscanf(ackStr, "ACK,%d,%d", &ackNode, &ackId) == 2 && ackNode == kNodeId && ackId == expectedId) {
+        Serial.printf("  ACK received for node %d id %d\n", ackNode, ackId);
         return true;
     }
 
@@ -468,8 +485,8 @@ static bool waitForAck(uint16_t expectedId) {
     return false;
 }
 
-// Sends an encrypted "<type>,<id>,<location>[,<contacts>]" packet. Type is "OK"
-// or "SOS"; id lets waitForAck() match the reply. Contacts ride on every SOS send
+// Sends an encrypted "<type>,<node>,<id>,<location>[,<contacts>]" packet. Type is
+// "OK" or "SOS"; node+id let waitForAck() match the reply. Contacts ride on every SOS send
 // so any single packet is enough; they're dropped if too long, since the
 // location must never fail to send.
 static void sendLocationPacket(const char *type) {
@@ -481,7 +498,7 @@ static void sendLocationPacket(const char *type) {
     Serial.printf("  battery: %s\n", battery);
 
     uint16_t msgId = nextMessageId++;
-    String payload = String(type) + "," + String(msgId) + "," + buildLocationMessage();
+    String payload = String(type) + "," + String(kNodeId) + "," + String(msgId) + "," + buildLocationMessage();
 
     static constexpr size_t kMaxPlaintextLen = 160;
 
@@ -668,7 +685,8 @@ void setup() {
     char bootLine[24];
     snprintf(bootLine, sizeof(bootLine), "Hiker's Comp v%s", FIRMWARE_VERSION);
     showStatus(bootLine, "Ready");
-    Serial.printf("Hiker's Companion v%s - GPS/LoRa send loop ready (SF%d)\n", FIRMWARE_VERSION, LORA_SPREADING_FACTOR);
+    Serial.printf("Hiker's Companion v%s - GPS/LoRa send loop ready (node %d, SF%d, %d dBm, %lu ms interval)\n",
+                  FIRMWARE_VERSION, kNodeId, LORA_SPREADING_FACTOR, LORA_TX_POWER_DBM, (unsigned long)SEND_INTERVAL_MS);
     holdDisplayThenSleep();
 }
 
