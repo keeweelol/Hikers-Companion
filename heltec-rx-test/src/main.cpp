@@ -29,13 +29,17 @@ static constexpr uint8_t OLED_WIDTH = 128;
 static constexpr uint8_t OLED_HEIGHT = 64;
 static constexpr uint8_t OLED_I2C_ADDR = 0x3C;
 
-// Must match LORA_* constants in firmware/src/main.cpp. SF is set per build with
-// -DLORA_SF=<7-12> (see the heltec-sfN envs in platformio.ini); defaults to 10.
+// Must match LORA_* constants in firmware/src/main.cpp. SF and bandwidth are set
+// per build with -DLORA_SF=<7-12> and -DLORA_BW=<kHz> (see the envs in
+// platformio.ini); default SF12 at 500 kHz.
 #ifndef LORA_SF
-#define LORA_SF 10
+#define LORA_SF 12
+#endif
+#ifndef LORA_BW
+#define LORA_BW 500.0
 #endif
 static constexpr float LORA_FREQUENCY_MHZ = 915.0;
-static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
+static constexpr float LORA_BANDWIDTH_KHZ = LORA_BW;
 static constexpr uint8_t LORA_SPREADING_FACTOR = LORA_SF;
 static constexpr uint8_t LORA_CODING_RATE = 5;
 // ACK power, set per build like LORA_SF. Unset in RadioLib it would default to
@@ -246,8 +250,8 @@ void setup() {
     showBanner("Heltec RX", "Listening...");
     scheduleDisplayOff(DISPLAY_HOLD_MS);
 
-    Serial.printf("Heltec LoRa RX test ready - listening for T-Beam packets (SF%d, %d dBm ACKs)\n",
-                  LORA_SPREADING_FACTOR, LORA_TX_POWER_DBM);
+    Serial.printf("Heltec LoRa RX test ready - listening for T-Beam packets (SF%d, %.0f kHz, %d dBm ACKs)\n",
+                  LORA_SPREADING_FACTOR, LORA_BANDWIDTH_KHZ, LORA_TX_POWER_DBM);
 }
 
 void loop() {

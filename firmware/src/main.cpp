@@ -22,13 +22,21 @@
 static constexpr char FIRMWARE_VERSION[] = "0.6.1";
 
 // ---- Radio configuration ----
-// US902-928 MHz ISM band. SF must match the Heltec receiver. Set per build with
-// -DLORA_SF=<7-12> (see the *-sfN envs in platformio.ini); defaults to 10.
+// US902-928 MHz ISM band. SF and bandwidth must match the Heltec receiver. Set
+// per build with -DLORA_SF=<7-12> and -DLORA_BW=<kHz> (see the envs in
+// platformio.ini); default SF12 at 500 kHz. At 500 kHz this is a digital
+// modulation system under FCC 15.247(a)(2): one fixed channel is allowed with
+// no hopping or 400 ms dwell limit, as long as the measured 6 dB bandwidth is
+// at least 500 kHz. SF12/500 has the same symbol time as SF10/125, so range
+// and airtime stay close to the original SF10/125 setup.
 #ifndef LORA_SF
-#define LORA_SF 10
+#define LORA_SF 12
+#endif
+#ifndef LORA_BW
+#define LORA_BW 500.0
 #endif
 static constexpr float LORA_FREQUENCY_MHZ = 915.0;
-static constexpr float LORA_BANDWIDTH_KHZ = 125.0;
+static constexpr float LORA_BANDWIDTH_KHZ = LORA_BW;
 static constexpr uint8_t LORA_SPREADING_FACTOR = LORA_SF;
 static constexpr uint8_t LORA_CODING_RATE = 5;
 
@@ -697,8 +705,8 @@ void setup() {
     char bootLine[24];
     snprintf(bootLine, sizeof(bootLine), "Hiker's Comp v%s", FIRMWARE_VERSION);
     showStatus(bootLine, "Ready");
-    Serial.printf("Hiker's Companion v%s - GPS/LoRa send loop ready (node %d, SF%d, %d dBm, %lu ms interval)\n",
-                  FIRMWARE_VERSION, kNodeId, LORA_SPREADING_FACTOR, LORA_TX_POWER_DBM, (unsigned long)SEND_INTERVAL_MS);
+    Serial.printf("Hiker's Companion v%s - GPS/LoRa send loop ready (node %d, SF%d, %.0f kHz, %d dBm, %lu ms interval)\n",
+                  FIRMWARE_VERSION, kNodeId, LORA_SPREADING_FACTOR, LORA_BANDWIDTH_KHZ, LORA_TX_POWER_DBM, (unsigned long)SEND_INTERVAL_MS);
     holdDisplayThenSleep();
 }
 

@@ -181,8 +181,14 @@ python3 -m venv .venv
 ## Config knobs (top of `src/main.cpp`)
 
 - `LORA_FREQUENCY_MHZ` — 915 MHz (US915 ISM band)
-- `LORA_SPREADING_FACTOR` — currently SF10, placeholder until range testing
-  picks a value from the report's SF7-SF12 tradeoff space
+- `LORA_SPREADING_FACTOR` / `LORA_BANDWIDTH_KHZ` — SF12 at 500 kHz. At 500 kHz
+  the radio counts as a digital modulation system (FCC 47 CFR 15.247(a)(2)), so
+  it may stay on one channel with no hopping or 400 ms dwell limit; at 125 kHz
+  it would have to hop across 50+ channels. This relies on the measured 6 dB
+  bandwidth being at least 500 kHz, which still needs checking on a spectrum
+  analyzer. SF12/500 has the same symbol time as the old SF10/125, so range
+  (~1 dB less) and airtime are about the same. Set per build with `-DLORA_SF`
+  and `-DLORA_BW`
 - `SEND_INTERVAL_MS` — currently 60s, matches the flow chart's "poll every
   minute" behavior
 
