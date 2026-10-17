@@ -19,7 +19,7 @@
 #include "pins.h"
 
 // Bump this alongside the git tag (vX.Y.Z) for each release.
-static constexpr char FIRMWARE_VERSION[] = "0.6.1";
+static constexpr char FIRMWARE_VERSION[] = "0.7.0";
 
 // ---- Radio configuration ----
 // US902-928 MHz ISM band. SF and bandwidth must match the Heltec receiver. Set
