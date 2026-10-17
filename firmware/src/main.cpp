@@ -185,16 +185,28 @@ static void initGPS() {
     SerialGPS.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 }
 
+// The bare COG driver chip can fail to init in direct sunlight, so boot retries
+// for a while (giving the user time to shade it) before giving up.
+static constexpr uint8_t DISPLAY_INIT_ATTEMPTS = 5;
+static constexpr uint32_t DISPLAY_INIT_RETRY_MS = 2000;
+
 // Non-fatal: GPS/LoRa/SOS must keep working with a dead display.
 static void initDisplay() {
-    Wire.begin(I2C_SDA, I2C_SCL);
-    for (uint8_t addr : DISPLAY_I2C_ADDR_CANDIDATES) {
-        if (display.begin(addr, true)) {
-            displayI2cAddr = addr;
-            displayAvailable = true;
-            display.clearDisplay();
-            display.display();
-            return;
+    for (uint8_t attempt = 1; attempt <= DISPLAY_INIT_ATTEMPTS; attempt++) {
+        Wire.begin(I2C_SDA, I2C_SCL);
+        for (uint8_t addr : DISPLAY_I2C_ADDR_CANDIDATES) {
+            if (display.begin(addr, true)) {
+                displayI2cAddr = addr;
+                displayAvailable = true;
+                display.clearDisplay();
+                display.display();
+                return;
+            }
+        }
+        if (attempt < DISPLAY_INIT_ATTEMPTS) {
+            Serial.printf("Display init attempt %u/%u failed, retrying in %lu ms\n", attempt, DISPLAY_INIT_ATTEMPTS,
+                          (unsigned long)DISPLAY_INIT_RETRY_MS);
+            delay(DISPLAY_INIT_RETRY_MS);
         }
     }
     Serial.println("Display init failed at 0x3C and 0x3D - continuing without it");
